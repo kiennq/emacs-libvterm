@@ -147,7 +147,7 @@ Only applicable for Windows."
                       (or forced
                           (not (file-exists-p (expand-file-name
                                                (format "vterm-module%s" module-file-suffix))))))))
-    (let* ((bin-file "vterm-x86_64.zip")
+    (let* ((bin-file "vterm-x86_64-windows.zip")
            (url (format "https://github.com/kiennq/emacs-libvterm/releases/latest/download/%s" bin-file))
            (exec-path (append exec-path `(,(expand-file-name
                                             (concat exec-directory "../../../../bin"))))))
