@@ -1,3 +1,5 @@
 /build
 /vterm-module.so
 *.elc
+vterm-module.dll
+conpty_proxy.exe
