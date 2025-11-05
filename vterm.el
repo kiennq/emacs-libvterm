@@ -89,6 +89,11 @@ confirmation before compiling."
   :type  'boolean
   :group 'vterm)
 
+(defcustom vterm-binaries-dir nil
+  "If not nil, use this directory to look for compiled vterm-module."
+  :type 'directory
+  :group 'vterm)
+
 (defvar vterm-install-buffer-name " *Install vterm* "
   "Name of the buffer used for compiling vterm-module.")
 
@@ -132,14 +137,44 @@ the executable."
           (message "Compilation of `emacs-libvterm' module succeeded")
         (error "Compilation of `emacs-libvterm' module failed!")))))
 
+(defun vterm--ensure-binary (&optional forced)
+  "Ensure the vterm module binarines.
+Will redownload if FORCED.
+Only applicable for Windows."
+  (interactive "P")
+  (when-let* ((default-directory (or vterm-binaries-dir (file-name-directory (find-library-name "vterm.el"))))
+              (_ (and (eq system-type 'windows-nt)
+                      (or forced
+                          (not (file-exists-p (expand-file-name
+                                               (format "vterm-module%s" module-file-suffix))))))))
+    (let* ((bin-file "vterm-x86_64.zip")
+           (url (format "https://github.com/kiennq/emacs-libvterm/releases/latest/download/%s" bin-file))
+           (exec-path (append exec-path `(,(expand-file-name
+                                            (concat exec-directory "../../../../bin"))))))
+      (unless (file-directory-p default-directory)
+        (make-directory default-directory 'parents))
+      (url-copy-file url bin-file 'ok-if-already-exists)
+      (call-process "tar" nil nil nil "xf" bin-file))))
+
 ;; If the vterm-module is not compiled yet, compile it
-(unless (require 'vterm-module nil t)
-  (if (or vterm-always-compile-module
+(unless (require 'vterm-module
+                 (when vterm-binaries-dir
+                   (expand-file-name (format "vterm-module%s" module-file-suffix)
+                                     vterm-binaries-dir))
+                 t)
+  (cond
+   ((eq system-type 'windows-nt)
+    (vterm--ensure-binary)
+    (require 'vterm-module
+             (when vterm-binaries-dir
+               (expand-file-name (format "vterm-module%s" module-file-suffix)
+                                 vterm-binaries-dir))))
+   ((or vterm-always-compile-module
           (y-or-n-p "Vterm needs `vterm-module' to work.  Compile it now? "))
-      (progn
-        (vterm-module-compile)
-        (require 'vterm-module))
-    (error "Vterm will not work until `vterm-module' is compiled!")))
+    (vterm-module-compile)
+    (require 'vterm-module))
+   (t
+    (error "Vterm will not work until `vterm-module' is compiled!"))))
 
 ;;; Dependencies
 
@@ -1411,11 +1446,11 @@ looks like: ((\"m\" :shift ))"
           (setq ev-keys (funcall input-method-function raw-key))
           (when (listp ev-keys)
             (dolist (k ev-keys)
-              (when-let ((key (key-description (vector k))))
+              (when-let* ((key (key-description (vector k))))
                 (when (and (not (symbolp event)) shift (not meta) (not ctrl))
                   (setq key (upcase key)))
                 (setq keys (append keys (list (list key shift meta ctrl))))))))
-      (when-let ((key (key-description (vector raw-key))))
+      (when-let* ((key (key-description (vector raw-key))))
         (when (and (not (symbolp event)) shift (not meta) (not ctrl))
           (setq key (upcase key)))
         (setq keys  (list (list key shift meta ctrl)))))
