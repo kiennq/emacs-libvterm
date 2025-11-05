@@ -1,0 +1,68 @@
+name: Release vterm-module
+on:
+  push:
+    branches:
+    - master
+    paths:
+    - '*.c'
+    - '*.h'
+    - '.github/workflows/build_module.yml'
+
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: ucrt64
+          install: >-
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-libvterm
+            mingw-w64-ucrt-x86_64-libtool
+            mingw-w64-ucrt-x86_64-gcc
+            make
+            zip
+
+      - name: Get latest release
+        continue-on-error: true
+        id: cur_release
+        uses: pozetroninc/github-action-get-latest-release@master
+        with:
+          repository: ${{ github.repository }}
+          excludes: draft
+
+      - name: Get version
+        run: |
+          base_ver=`cat vterm.el | grep -Po ';; Version: \K[\d.]+'`
+          sha=${GITHUB_SHA::6}
+          version=$([[ $prerelease == true  ]] && echo ${base_ver}.${{ github.run_number }}.$sha || echo ${base_ver})
+          cur_ver=$([[ ${{ steps.cur_release.outcome }} == failure ]] && echo v0 || echo ${{ steps.cur_release.outputs.release }})
+          [[ v$version == $cur_ver ]] && exit 1
+          echo "version=$version" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          cmake -DUSE_SYSTEM_LIBVTERM=OFF -DCMAKE_BUILD_TYPE=Release -Bbuild -S .
+          cmake --build build
+          zip vterm-x86_64-windows.zip *.dll *.exe
+
+      - name: Create release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ env.version }}
+          name: ${{ env.version }}
+          draft: false
+          prerelease: false
+          artifactErrorsFailBuild: true
+          artifacts: vterm-x86_64-windows.zip
+          artifactContentType: application/zip
+          token: ${{ secrets.GITHUB_TOKEN }}
