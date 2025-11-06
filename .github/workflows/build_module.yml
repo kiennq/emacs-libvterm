@@ -44,7 +44,7 @@ jobs:
         run: |
           base_ver=`cat vterm.el | grep -Po ';; Version: \K[\d.]+'`
           sha=${GITHUB_SHA::6}
-          version=$([[ $prerelease == true  ]] && echo ${base_ver}.${{ github.run_number }}.$sha || echo ${base_ver})
+          version=$(echo ${base_ver}.${{ github.run_number }}.$sha)
           cur_ver=$([[ ${{ steps.cur_release.outcome }} == failure ]] && echo v0 || echo ${{ steps.cur_release.outputs.release }})
           [[ v$version == $cur_ver ]] && exit 1
           echo "version=$version" >> $GITHUB_ENV
