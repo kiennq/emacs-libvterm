@@ -137,10 +137,11 @@ the executable."
           (message "Compilation of `emacs-libvterm' module succeeded")
         (error "Compilation of `emacs-libvterm' module failed!")))))
 
-(defun vterm--ensure-binary (&optional forced)
+;;;###autoload
+(defun vterm-ensure-binary (&optional forced)
   "Ensure the vterm module binarines.
 Will redownload if FORCED.
-Only applicable for Windows."
+Currently only applicable for Windows."
   (interactive "P")
   (when-let* ((default-directory (or vterm-binaries-dir (file-name-directory (find-library-name "vterm.el"))))
               (_ (and (eq system-type 'windows-nt)
@@ -164,7 +165,7 @@ Only applicable for Windows."
                  t)
   (cond
    ((eq system-type 'windows-nt)
-    (vterm--ensure-binary)
+    (vterm-ensure-binary)
     (require 'vterm-module
              (when vterm-binaries-dir
                (expand-file-name (format "vterm-module%s" module-file-suffix)
