@@ -1553,10 +1553,29 @@ If not found in PATH, look in the vterm.el directory."
     (process-put conpty-process 'conpty-id conpty-id)
     conpty-process))
 
-(defun vterm--conpty-proxy-resize(width height)
+(defun vterm--conpty-proxy-resize(proc width height)
   "Call conpty proxy resize command."
-  (let ((conpty-id (process-get vterm--process 'conpty-id)))
-    (shell-command-to-string (format "%s resize %s %s %s" (vterm--conpty-proxy-path) conpty-id width height))))
+  ;; debounce creating new process by using timer
+  (let ((conpty-id (process-get proc 'conpty-id)))
+    (make-process
+     :name "vterm-resize"
+     :command `(,(vterm--conpty-proxy-path) "resize"
+                ,conpty-id ,(int-to-string width) ,(int-to-string height))))
+  (cons width height))
+
+(defvar-local vterm--conpty-proxy-resize-timer nil
+  "Timer for conpty proxy resize.")
+
+(defun vterm--conpty-proxy-debounce-resize (width height)
+  "Debounce conpty proxy resize calls."
+  (when (timerp vterm--conpty-proxy-resize-timer)
+    (cancel-timer vterm--conpty-proxy-resize-timer))
+  (setq vterm--conpty-proxy-resize-timer
+        (run-with-timer
+         vterm-timer-delay nil
+         (lambda (proc w h) (vterm--conpty-proxy-resize proc w h))
+         vterm--process width height))
+  (cons width height))
 
 ;;; Entry Points
 
@@ -1763,7 +1782,7 @@ Argument EVENT process event."
                  (> height 0))
         (vterm--set-size vterm--term height width)
         (when (eq system-type 'windows-nt)
-          (vterm--conpty-proxy-resize width height))
+          (vterm--conpty-proxy-debounce-resize width height))
         (cons width height)))))
 
 (defun vterm--get-margin-width ()
