@@ -137,6 +137,11 @@ the executable."
           (message "Compilation of `emacs-libvterm' module succeeded")
         (error "Compilation of `emacs-libvterm' module failed!")))))
 
+(defcustom vterm-binaries-download-url "https://github.com/kiennq/emacs-libvterm/releases/latest/download/%s"
+  "URL template to download precompiled vterm binaries."
+  :type 'string
+  :group 'vterm)
+
 ;;;###autoload
 (defun vterm-ensure-binary (&optional forced)
   "Ensure the vterm module binarines.
@@ -149,11 +154,15 @@ Currently only applicable for Windows."
                           (not (file-exists-p (expand-file-name
                                                (format "vterm-module%s" module-file-suffix))))))))
     (let* ((bin-file "vterm-x86_64-windows.zip")
-           (url (format "https://github.com/kiennq/emacs-libvterm/releases/latest/download/%s" bin-file))
+           (url (format vterm-binaries-download-url bin-file))
            (exec-path (append exec-path `(,(expand-file-name
                                             (concat exec-directory "../../../../bin"))))))
       (unless (file-directory-p default-directory)
         (make-directory default-directory 'parents))
+      ;; move all *.exe and *.dll files to *.old on Windows
+      (dolist (f (directory-files default-directory t "\\.\\(exe\\|dll\\)\\'"))
+        (ignore-errors
+          (rename-file f (concat f ".old") 'ok-if-already-exists)))
       (url-copy-file url bin-file 'ok-if-already-exists)
       (call-process "tar" nil nil nil "xf" bin-file))))
 
