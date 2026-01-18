@@ -1572,16 +1572,26 @@ If not found in PATH, look in the vterm.el directory."
 (defvar-local vterm--conpty-proxy-resize-timer nil
   "Timer for conpty proxy resize.")
 
+(defvar-local vterm--last-width 0
+  "Last width for conpty proxy resize.")
+
+(defvar-local vterm--last-height 0
+  "Last height for conpty proxy resize.")
+
 (defun vterm--conpty-proxy-debounce-resize (width height)
   "Debounce conpty proxy resize calls."
-  (when (timerp vterm--conpty-proxy-resize-timer)
-    (cancel-timer vterm--conpty-proxy-resize-timer))
-  (setq vterm--conpty-proxy-resize-timer
-        (run-with-timer
-         vterm-timer-delay nil
-         (lambda (proc w h) (vterm--conpty-proxy-resize proc w h))
-         vterm--process width height))
-  (cons width height))
+  (unless (and (= width vterm--last-width)
+               (= height vterm--last-height))
+    (when (timerp vterm--conpty-proxy-resize-timer)
+      (cancel-timer vterm--conpty-proxy-resize-timer))
+    (setq vterm--conpty-proxy-resize-timer
+          (run-with-timer
+           vterm-timer-delay nil
+           (lambda (proc w h) (vterm--conpty-proxy-resize proc w h))
+           vterm--process width height))
+    (setq vterm--last-width width
+          vterm--last-height height))
+  (cons vterm--last-width vterm--last-height))
 
 ;;; Entry Points
 
@@ -1869,9 +1879,13 @@ may optionally contain `:underline' or `:inverse-video' for cells
 with underline or inverse video attribute.  If ARGS contains
 `:foreground', use foreground color of the respective face
 instead of background."
-  (let ((foreground    (member :foreground args))
-        (underline     (member :underline args))
-        (inverse-video (member :inverse-video args)))
+  (let* ((foreground    (member :foreground args))
+         (underline     (member :underline args))
+         (inverse-video (member :inverse-video args))
+         ;; Use the frame where vterm is displayed, not selected frame
+         (frame         (or (when-let* ((win (get-buffer-window (current-buffer) t)))
+                              (window-frame win))
+                            (selected-frame))))
     (funcall (if foreground #'face-foreground #'face-background)
              (cond
               ((and (>= index 0) (< index 16))
@@ -1881,7 +1895,7 @@ instead of background."
               ((and (= index -1) (not foreground) inverse-video)
                'vterm-color-inverse-video)
               (t 'default))
-             nil 'default)))
+             frame 'default)))
 
 (defun vterm--eval (str)
   "Check if string STR is `vterm-eval-cmds' and execute command.
