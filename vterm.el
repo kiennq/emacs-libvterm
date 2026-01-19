@@ -1766,6 +1766,9 @@ Argument EVENT process event."
 
 (advice-add #'text-scale-mode :after #'vterm--text-scale-mode)
 
+(defvar-local vterm--last-width 0 "Last width set to libvterm.")
+(defvar-local vterm--last-height 0 "Last height set to libvterm.")
+
 (defun vterm--window-adjust-process-window-size (process windows)
   "Adjust width of window WINDOWS associated to process PROCESS.
 
@@ -1785,10 +1788,15 @@ Argument EVENT process event."
       (when (and (processp process)
                  (process-live-p process)
                  (> width 0)
-                 (> height 0))
+                 (> height 0)
+                 (or (/= width vterm--last-width)
+                     ;; small chaneg in height might caused by minibuffer, we skip it
+                     (> (abs (- height vterm--last-height)) 1)))
         (vterm--set-size vterm--term height width)
         (when (eq system-type 'windows-nt)
           (vterm--conpty-proxy-debounce-resize width height))
+        (setq vterm--last-width width
+              vterm--last-height height)
         (cons width height)))))
 
 (defun vterm--get-margin-width ()
@@ -1869,9 +1877,13 @@ may optionally contain `:underline' or `:inverse-video' for cells
 with underline or inverse video attribute.  If ARGS contains
 `:foreground', use foreground color of the respective face
 instead of background."
-  (let ((foreground    (member :foreground args))
-        (underline     (member :underline args))
-        (inverse-video (member :inverse-video args)))
+  (let* ((foreground    (member :foreground args))
+         (underline     (member :underline args))
+         (inverse-video (member :inverse-video args))
+         ;; Use the frame where vterm is displayed, not selected frame
+         (frame         (or (when-let* ((win (get-buffer-window (current-buffer) t)))
+                              (window-frame win))
+                            (selected-frame))))
     (funcall (if foreground #'face-foreground #'face-background)
              (cond
               ((and (>= index 0) (< index 16))
@@ -1881,7 +1893,7 @@ instead of background."
               ((and (= index -1) (not foreground) inverse-video)
                'vterm-color-inverse-video)
               (t 'default))
-             nil 'default)))
+             frame 'default)))
 
 (defun vterm--eval (str)
   "Check if string STR is `vterm-eval-cmds' and execute command.
