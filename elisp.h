@@ -76,6 +76,7 @@ void add_text_properties(emacs_env *env, emacs_value string,
                          emacs_value property);
 void erase_buffer(emacs_env *env);
 void insert(emacs_env *env, emacs_value string);
+void insert_batch(emacs_env *env, emacs_value *strings, ptrdiff_t count);
 void ding(emacs_env *env, emacs_value flag);
 void goto_char(emacs_env *env, int pos);
 void forward_line(emacs_env *env, int n);

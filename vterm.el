@@ -1676,68 +1676,60 @@ value of `vterm-buffer-name'."
 (defun vterm--filter (process input)
   "I/O Event.  Feeds PROCESS's INPUT to the virtual terminal.
 
-Then triggers a redraw from the module."
+Then triggers a redraw from the module.
+Optimized version: bypass Elisp regex parsing, send directly to libvterm
+which handles escape sequence parsing natively in C."
   (let ((inhibit-redisplay t)
         (inhibit-eol-conversion t)
         (inhibit-read-only t)
-        (buf (process-buffer process))
-        (i 0)
-        (str-length (length input))
-        decoded-substring
-        funny)
+        (buf (process-buffer process)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
-        ;; borrowed from term.el
-        ;; Handle non-control data.  Decode the string before
-        ;; counting characters, to avoid garbling of certain
-        ;; multibyte characters (https://github.com/akermu/emacs-libvterm/issues/394).
-        ;; same bug of term.el https://debbugs.gnu.org/cgi/bugreport.cgi?bug=1006
+        ;; Prepend any incomplete bytes from previous call
         (when vterm--undecoded-bytes
           (setq input (concat vterm--undecoded-bytes input))
-          (setq vterm--undecoded-bytes nil)
-          (setq str-length (length input)))
-        (while (< i str-length)
-          (setq funny (string-match vterm-control-seq-regexp input i))
-          (let ((ctl-end (if funny (match-end 0)
-                           (setq funny (string-match vterm-control-seq-prefix-regexp input i))
-                           (if funny
-                               (setq vterm--undecoded-bytes
-                                     (substring input funny))
-                             (setq funny str-length))
-                           ;; The control sequence ends somewhere
-                           ;; past the end of this string.
-                           (1+ str-length))))
-            (when (> funny i)
-              ;; Handle non-control data.  Decode the string before
-              ;; counting characters, to avoid garbling of certain
-              ;; multibyte characters (emacs bug#1006).
-              (setq decoded-substring
-                    (decode-coding-string
-                     (substring input i funny)
-                     vterm-decode-coding-system t))
-              ;; Check for multibyte characters that ends
-              ;; before end of string, and save it for
-              ;; next time.
-              (when (= funny str-length)
-                (let ((partial 0)
-                      (count (length decoded-substring)))
-                  (while (and (< partial count)
-                              (eq (char-charset (aref decoded-substring
-                                                      (- count 1 partial)))
-                                  'eight-bit))
-                    (cl-incf partial))
-                  (when (> (1+ count) partial 0)
-                    (setq vterm--undecoded-bytes
-                          (substring decoded-substring (- partial)))
-                    (setq decoded-substring
-                          (substring decoded-substring 0 (- partial)))
-                    (cl-decf str-length partial)
-                    (cl-decf funny partial))))
-              (ignore-errors (vterm--write-input vterm--term decoded-substring))
-              (setq i funny))
-            (when (<= ctl-end str-length)
-              (ignore-errors (vterm--write-input vterm--term (substring input i ctl-end))))
-            (setq i ctl-end)))
+          (setq vterm--undecoded-bytes nil))
+        ;; Find incomplete UTF-8 sequence at end of input
+        ;; UTF-8 continuation bytes are 10xxxxxx (0x80-0xBF)
+        ;; UTF-8 start bytes are 11xxxxxx (0xC0-0xFF)
+        (let* ((len (length input))
+               (incomplete-start nil))
+          ;; Scan backwards to find potential incomplete UTF-8 sequence
+          (when (> len 0)
+            (let ((i (1- len))
+                  (found-start nil))
+              ;; Look for incomplete sequence in last 4 bytes (max UTF-8 length)
+              (while (and (>= i (max 0 (- len 4)))
+                          (not found-start))
+                (let ((byte (aref input i)))
+                  (cond
+                   ;; ASCII byte (0x00-0x7F) - complete, stop scanning
+                   ((< byte #x80)
+                    (setq found-start t))
+                   ;; Continuation byte (0x80-0xBF) - keep scanning
+                   ((< byte #xC0)
+                    (cl-decf i))
+                   ;; Start byte (0xC0-0xFF) - check if sequence is complete
+                   (t
+                    (let ((expected-len
+                           (cond ((< byte #xE0) 2)
+                                 ((< byte #xF0) 3)
+                                 ((< byte #xF8) 4)
+                                 (t 1))))  ; Invalid, treat as single byte
+                      (when (> (+ i expected-len) len)
+                        ;; Incomplete sequence
+                        (setq incomplete-start i))
+                      (setq found-start t))))))
+              ;; Handle edge case: only continuation bytes found
+              (when (and (not found-start) (< i (max 0 (- len 4))))
+                (setq incomplete-start (max 0 (- len 4))))))
+          ;; Save incomplete bytes for next call
+          (when incomplete-start
+            (setq vterm--undecoded-bytes (substring input incomplete-start))
+            (setq input (substring input 0 incomplete-start))))
+        ;; Send all input directly to libvterm - it handles escape sequences natively
+        (when (> (length input) 0)
+          (ignore-errors (vterm--write-input vterm--term input)))
         (vterm--update vterm--term)))))
 
 (defun vterm--sentinel (process event)

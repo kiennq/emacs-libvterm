@@ -14,6 +14,9 @@
 #include <unistd.h>
 #include <vterm.h>
 
+/* Cached Emacs major version to avoid repeated symbol lookups */
+static int cached_emacs_major_version = 0;
+
 static LineInfo *alloc_lineinfo() {
   LineInfo *info = malloc(sizeof(LineInfo));
   info->directory = NULL;
@@ -314,12 +317,26 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
     length++;                                                                  \
   } while (0)
 
+#define BATCH_CAPACITY 256
+#define PUSH_SEGMENT(seg)                                                      \
+  do {                                                                         \
+    if (batch_count >= BATCH_CAPACITY) {                                       \
+      insert_batch(env, batch, batch_count);                                   \
+      batch_count = 0;                                                         \
+    }                                                                          \
+    batch[batch_count++] = (seg);                                              \
+  } while (0)
+
   int capacity = ((end_row - start_row + 1) * end_col) * 4;
   int length = 0;
   char *buffer = malloc(capacity * sizeof(char));
   VTermScreenCell cell;
   VTermScreenCell lastCell;
   fetch_cell(term, start_row, 0, &lastCell);
+
+  /* Batch array for collecting segments before inserting */
+  emacs_value batch[BATCH_CAPACITY];
+  int batch_count = 0;
 
   for (i = start_row; i < end_row; i++) {
 
@@ -329,19 +346,19 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
       fetch_cell(term, i, j, &cell);
       if (isprompt && length > 0) {
         emacs_value text = render_text(env, term, buffer, length, &lastCell);
-        insert(env, render_prompt(env, text));
+        PUSH_SEGMENT(render_prompt(env, text));
         length = 0;
       }
 
       isprompt = is_end_of_prompt(term, end_col, i, j);
       if (isprompt && length > 0) {
-        insert(env, render_text(env, term, buffer, length, &lastCell));
+        PUSH_SEGMENT(render_text(env, term, buffer, length, &lastCell));
         length = 0;
       }
 
       if (!compare_cells(&cell, &lastCell)) {
         emacs_value text = render_text(env, term, buffer, length, &lastCell);
-        insert(env, text);
+        PUSH_SEGMENT(text);
         length = 0;
       }
 
@@ -371,23 +388,30 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
     }
     if (isprompt && length > 0) {
       emacs_value text = render_text(env, term, buffer, length, &lastCell);
-      insert(env, render_prompt(env, text));
+      PUSH_SEGMENT(render_prompt(env, text));
       length = 0;
       isprompt = 0;
     }
 
     if (!newline) {
       emacs_value text = render_text(env, term, buffer, length, &lastCell);
-      insert(env, text);
+      PUSH_SEGMENT(text);
       length = 0;
       text = render_fake_newline(env, term);
-      insert(env, text);
+      PUSH_SEGMENT(text);
     }
   }
   emacs_value text = render_text(env, term, buffer, length, &lastCell);
-  insert(env, text);
+  PUSH_SEGMENT(text);
+
+  /* Flush remaining batch */
+  if (batch_count > 0) {
+    insert_batch(env, batch, batch_count);
+  }
 
 #undef PUSH_BUFFER
+#undef PUSH_SEGMENT
+#undef BATCH_CAPACITY
   free(buffer);
 
   return;
@@ -808,8 +832,8 @@ static emacs_value render_text(emacs_env *env, Term *term, char *buffer,
   emacs_value strike = cell->attrs.strike ? Qt : Qnil;
 
   // TODO: Blink, font, dwl, dhl is missing
-  int emacs_major_version =
-      env->extract_integer(env, symbol_value(env, Qemacs_major_version));
+  /* Use cached emacs_major_version instead of looking it up every call */
+  int emacs_major_version = cached_emacs_major_version;
   emacs_value properties;
   emacs_value props[64];
   int props_len = 0;
@@ -1588,6 +1612,10 @@ int emacs_module_init(struct emacs_runtime *ert) {
   fun = env->make_function(env, 1, 1, Fvterm_get_icrnl,
                            "Get the icrnl state of the pty", NULL);
   bind_function(env, "vterm--get-icrnl", fun);
+
+  /* Cache the Emacs major version for performance */
+  cached_emacs_major_version =
+      env->extract_integer(env, symbol_value(env, Qemacs_major_version));
 
   provide(env, "vterm-module");
 
