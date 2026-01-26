@@ -122,6 +122,11 @@ void insert(emacs_env *env, emacs_value string) {
   env->funcall(env, Finsert, 1, (emacs_value[]){string});
 }
 
+void insert_batch(emacs_env *env, emacs_value *strings, ptrdiff_t count) {
+  if (count <= 0) return;
+  env->funcall(env, Finsert, count, strings);
+}
+
 void ding(emacs_env *env, emacs_value flag) {
   env->funcall(env, Fding, 1, (emacs_value[]){flag});
 }

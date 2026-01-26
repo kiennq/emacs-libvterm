@@ -14,13 +14,292 @@
 #include <unistd.h>
 #include <vterm.h>
 
+/* Cached Emacs major version to avoid repeated symbol lookups */
+static int cached_emacs_major_version = 0;
+
+/* ============================================================================
+ * PERFORMANCE OPTIMIZATION: Key lookup hash table
+ * Instead of O(n) string comparisons, use hash-based O(1) lookup
+ * ============================================================================
+ */
+
+/* Simple FNV-1a hash for key strings */
+VTERM_INLINE uint32_t hash_key(const unsigned char *key, size_t len) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    hash ^= key[i];
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+/* Key types for fast dispatch */
+typedef enum {
+  KEY_UNKNOWN = 0,
+  KEY_CLEAR_SCROLLBACK,
+  KEY_START,
+  KEY_STOP,
+  KEY_START_PASTE,
+  KEY_END_PASTE,
+  KEY_TAB,
+  KEY_BACKTAB,
+  KEY_ISO_LEFTTAB,
+  KEY_BACKSPACE,
+  KEY_ESCAPE,
+  KEY_UP,
+  KEY_DOWN,
+  KEY_LEFT,
+  KEY_RIGHT,
+  KEY_INSERT,
+  KEY_DELETE,
+  KEY_HOME,
+  KEY_END,
+  KEY_PRIOR,
+  KEY_NEXT,
+  KEY_F0,
+  KEY_F1,
+  KEY_F2,
+  KEY_F3,
+  KEY_F4,
+  KEY_F5,
+  KEY_F6,
+  KEY_F7,
+  KEY_F8,
+  KEY_F9,
+  KEY_F10,
+  KEY_F11,
+  KEY_F12,
+  KEY_KP_0,
+  KEY_KP_1,
+  KEY_KP_2,
+  KEY_KP_3,
+  KEY_KP_4,
+  KEY_KP_5,
+  KEY_KP_6,
+  KEY_KP_7,
+  KEY_KP_8,
+  KEY_KP_9,
+  KEY_KP_ADD,
+  KEY_KP_SUBTRACT,
+  KEY_KP_MULTIPLY,
+  KEY_KP_DIVIDE,
+  KEY_KP_EQUAL,
+  KEY_KP_DECIMAL,
+  KEY_KP_SEPARATOR,
+  KEY_KP_ENTER,
+  KEY_SPC
+} KeyType;
+
+/* Hash table entry for key lookup */
+typedef struct {
+  const char *name;
+  size_t len;
+  uint32_t hash;
+  KeyType type;
+  VTermKey vterm_key; /* VTERM_KEY_NONE if not a direct vterm key */
+} KeyEntry;
+
+/* Precomputed key table - initialized once */
+static KeyEntry key_table[] = {
+    {"<clear_scrollback>", 19, 0, KEY_CLEAR_SCROLLBACK, VTERM_KEY_NONE},
+    {"<start>", 7, 0, KEY_START, VTERM_KEY_NONE},
+    {"<stop>", 6, 0, KEY_STOP, VTERM_KEY_NONE},
+    {"<start_paste>", 13, 0, KEY_START_PASTE, VTERM_KEY_NONE},
+    {"<end_paste>", 11, 0, KEY_END_PASTE, VTERM_KEY_NONE},
+    {"<tab>", 5, 0, KEY_TAB, VTERM_KEY_TAB},
+    {"<backtab>", 9, 0, KEY_BACKTAB, VTERM_KEY_TAB},
+    {"<iso-lefttab>", 13, 0, KEY_ISO_LEFTTAB, VTERM_KEY_TAB},
+    {"<backspace>", 11, 0, KEY_BACKSPACE, VTERM_KEY_BACKSPACE},
+    {"<escape>", 8, 0, KEY_ESCAPE, VTERM_KEY_ESCAPE},
+    {"<up>", 4, 0, KEY_UP, VTERM_KEY_UP},
+    {"<down>", 6, 0, KEY_DOWN, VTERM_KEY_DOWN},
+    {"<left>", 6, 0, KEY_LEFT, VTERM_KEY_LEFT},
+    {"<right>", 7, 0, KEY_RIGHT, VTERM_KEY_RIGHT},
+    {"<insert>", 8, 0, KEY_INSERT, VTERM_KEY_INS},
+    {"<delete>", 8, 0, KEY_DELETE, VTERM_KEY_DEL},
+    {"<home>", 6, 0, KEY_HOME, VTERM_KEY_HOME},
+    {"<end>", 5, 0, KEY_END, VTERM_KEY_END},
+    {"<prior>", 7, 0, KEY_PRIOR, VTERM_KEY_PAGEUP},
+    {"<next>", 6, 0, KEY_NEXT, VTERM_KEY_PAGEDOWN},
+    {"<f0>", 4, 0, KEY_F0, VTERM_KEY_FUNCTION(0)},
+    {"<f1>", 4, 0, KEY_F1, VTERM_KEY_FUNCTION(1)},
+    {"<f2>", 4, 0, KEY_F2, VTERM_KEY_FUNCTION(2)},
+    {"<f3>", 4, 0, KEY_F3, VTERM_KEY_FUNCTION(3)},
+    {"<f4>", 4, 0, KEY_F4, VTERM_KEY_FUNCTION(4)},
+    {"<f5>", 4, 0, KEY_F5, VTERM_KEY_FUNCTION(5)},
+    {"<f6>", 4, 0, KEY_F6, VTERM_KEY_FUNCTION(6)},
+    {"<f7>", 4, 0, KEY_F7, VTERM_KEY_FUNCTION(7)},
+    {"<f8>", 4, 0, KEY_F8, VTERM_KEY_FUNCTION(8)},
+    {"<f9>", 4, 0, KEY_F9, VTERM_KEY_FUNCTION(9)},
+    {"<f10>", 5, 0, KEY_F10, VTERM_KEY_FUNCTION(10)},
+    {"<f11>", 5, 0, KEY_F11, VTERM_KEY_FUNCTION(11)},
+    {"<f12>", 5, 0, KEY_F12, VTERM_KEY_FUNCTION(12)},
+    {"<kp-0>", 6, 0, KEY_KP_0, VTERM_KEY_KP_0},
+    {"<kp-1>", 6, 0, KEY_KP_1, VTERM_KEY_KP_1},
+    {"<kp-2>", 6, 0, KEY_KP_2, VTERM_KEY_KP_2},
+    {"<kp-3>", 6, 0, KEY_KP_3, VTERM_KEY_KP_3},
+    {"<kp-4>", 6, 0, KEY_KP_4, VTERM_KEY_KP_4},
+    {"<kp-5>", 6, 0, KEY_KP_5, VTERM_KEY_KP_5},
+    {"<kp-6>", 6, 0, KEY_KP_6, VTERM_KEY_KP_6},
+    {"<kp-7>", 6, 0, KEY_KP_7, VTERM_KEY_KP_7},
+    {"<kp-8>", 6, 0, KEY_KP_8, VTERM_KEY_KP_8},
+    {"<kp-9>", 6, 0, KEY_KP_9, VTERM_KEY_KP_9},
+    {"<kp-add>", 8, 0, KEY_KP_ADD, VTERM_KEY_KP_PLUS},
+    {"<kp-subtract>", 13, 0, KEY_KP_SUBTRACT, VTERM_KEY_KP_MINUS},
+    {"<kp-multiply>", 13, 0, KEY_KP_MULTIPLY, VTERM_KEY_KP_MULT},
+    {"<kp-divide>", 11, 0, KEY_KP_DIVIDE, VTERM_KEY_KP_DIVIDE},
+    {"<kp-equal>", 10, 0, KEY_KP_EQUAL, VTERM_KEY_KP_EQUAL},
+    {"<kp-decimal>", 12, 0, KEY_KP_DECIMAL, VTERM_KEY_KP_PERIOD},
+    {"<kp-separator>", 14, 0, KEY_KP_SEPARATOR, VTERM_KEY_KP_COMMA},
+    {"<kp-enter>", 10, 0, KEY_KP_ENTER, VTERM_KEY_KP_ENTER},
+    {"SPC", 3, 0, KEY_SPC, VTERM_KEY_NONE},
+    {NULL, 0, 0, KEY_UNKNOWN, VTERM_KEY_NONE}};
+
+/* Hash table buckets for O(1) lookup */
+#define KEY_HASH_SIZE 128
+static KeyEntry *key_hash_table[KEY_HASH_SIZE];
+static bool key_table_initialized = false;
+
+static void init_key_table(void) {
+  if (key_table_initialized)
+    return;
+
+  /* Precompute hashes and build hash table */
+  for (int i = 0; key_table[i].name != NULL; i++) {
+    key_table[i].len = strlen(key_table[i].name);
+    key_table[i].hash =
+        hash_key((const unsigned char *)key_table[i].name, key_table[i].len);
+
+    /* Simple linear probing */
+    uint32_t idx = key_table[i].hash % KEY_HASH_SIZE;
+    while (key_hash_table[idx] != NULL) {
+      idx = (idx + 1) % KEY_HASH_SIZE;
+    }
+    key_hash_table[idx] = &key_table[i];
+  }
+  key_table_initialized = true;
+}
+
+/* Fast key lookup using hash table */
+VTERM_INLINE KeyEntry *lookup_key(const unsigned char *key, size_t len) {
+  if (VTERM_UNLIKELY(!key_table_initialized)) {
+    init_key_table();
+  }
+
+  uint32_t h = hash_key(key, len);
+  uint32_t idx = h % KEY_HASH_SIZE;
+  int probes = 0;
+
+  while (key_hash_table[idx] != NULL && probes < KEY_HASH_SIZE) {
+    KeyEntry *entry = key_hash_table[idx];
+    if (entry->hash == h && entry->len == len &&
+        memcmp(entry->name, key, len) == 0) {
+      return entry;
+    }
+    idx = (idx + 1) % KEY_HASH_SIZE;
+    probes++;
+  }
+  return NULL;
+}
+
+/* ============================================================================
+ * PERFORMANCE OPTIMIZATION: Circular buffer helpers for scrollback
+ * Provides O(1) push/pop instead of O(n) memmove operations
+ * ============================================================================
+ */
+
+/* Forward declaration needed for sb_push */
+static void free_lineinfo(LineInfo *line);
+
+/* Get the actual index in the circular buffer */
+VTERM_INLINE size_t sb_index(Term *term, size_t logical_idx) {
+  return (term->sb_head + logical_idx) % term->sb_size;
+}
+
+/* Get scrollback line at logical index (0 = newest, sb_current-1 = oldest) */
+VTERM_INLINE ScrollbackLine *sb_get(Term *term, size_t logical_idx) {
+  if (logical_idx >= term->sb_current)
+    return NULL;
+  /* Newest is at tail-1, oldest is at head */
+  /* For logical_idx 0 (newest), we want tail-1 */
+  size_t actual_idx =
+      (term->sb_tail + term->sb_size - 1 - logical_idx) % term->sb_size;
+  return term->sb_buffer[actual_idx];
+}
+
+/* Push a new line to the scrollback buffer (at the newest position) */
+VTERM_INLINE void sb_push(Term *term, ScrollbackLine *line) {
+  if (term->sb_current == term->sb_size) {
+    /* Buffer full - free oldest and advance head */
+    ScrollbackLine *old = term->sb_buffer[term->sb_head];
+    if (old != NULL) {
+      if (old->info != NULL) {
+        free_lineinfo(old->info);
+      }
+      free(old);
+    }
+    term->sb_head = (term->sb_head + 1) % term->sb_size;
+  } else {
+    term->sb_current++;
+  }
+  term->sb_buffer[term->sb_tail] = line;
+  term->sb_tail = (term->sb_tail + 1) % term->sb_size;
+}
+
+/* Pop the oldest line from scrollback buffer */
+VTERM_INLINE ScrollbackLine *sb_pop_oldest(Term *term) {
+  if (term->sb_current == 0)
+    return NULL;
+  ScrollbackLine *line = term->sb_buffer[term->sb_head];
+  term->sb_buffer[term->sb_head] = NULL;
+  term->sb_head = (term->sb_head + 1) % term->sb_size;
+  term->sb_current--;
+  return line;
+}
+
+/* Pop the newest line from scrollback buffer */
+VTERM_INLINE ScrollbackLine *sb_pop_newest(Term *term) {
+  if (term->sb_current == 0)
+    return NULL;
+  term->sb_tail = (term->sb_tail + term->sb_size - 1) % term->sb_size;
+  ScrollbackLine *line = term->sb_buffer[term->sb_tail];
+  term->sb_buffer[term->sb_tail] = NULL;
+  term->sb_current--;
+  return line;
+}
+
+/* ============================================================================
+ * PERFORMANCE OPTIMIZATION: Faster cell comparison
+ * Use memcmp for color comparison when possible
+ * ============================================================================
+ */
+
+VTERM_INLINE bool fast_compare_cells(VTermScreenCell *a, VTermScreenCell *b) {
+  /* First compare attributes as a single check - most cells have same attrs */
+  if (a->attrs.bold != b->attrs.bold ||
+      a->attrs.underline != b->attrs.underline ||
+      a->attrs.italic != b->attrs.italic ||
+      a->attrs.reverse != b->attrs.reverse ||
+      a->attrs.strike != b->attrs.strike) {
+    return false;
+  }
+
+  /* Compare colors - use type-specific comparison */
+  if (!vterm_color_is_equal(&a->fg, &b->fg))
+    return false;
+  if (!vterm_color_is_equal(&a->bg, &b->bg))
+    return false;
+
+  return true;
+}
+
 static LineInfo *alloc_lineinfo() {
   LineInfo *info = malloc(sizeof(LineInfo));
   info->directory = NULL;
   info->prompt_col = -1;
   return info;
 }
-void free_lineinfo(LineInfo *line) {
+static void free_lineinfo(LineInfo *line) {
   if (line == NULL) {
     return;
   }
@@ -37,29 +316,29 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
     return 0;
   }
 
-  // copy vterm cells into sb_buffer
+  // copy vterm cells into sb_buffer using circular buffer (O(1) instead of O(n)
+  // memmove)
   size_t c = (size_t)cols;
   ScrollbackLine *sbrow = NULL;
+
   if (term->sb_current == term->sb_size) {
-    if (term->sb_buffer[term->sb_current - 1]->cols == c) {
-      // Recycle old row if it's the right size
-      sbrow = term->sb_buffer[term->sb_current - 1];
-    } else {
-      if (term->sb_buffer[term->sb_current - 1]->info != NULL) {
-        free_lineinfo(term->sb_buffer[term->sb_current - 1]->info);
-        term->sb_buffer[term->sb_current - 1]->info = NULL;
+    // Buffer is full - recycle oldest entry at sb_head
+    ScrollbackLine *oldest = term->sb_buffer[term->sb_head];
+    if (oldest != NULL) {
+      if (oldest->cols == c) {
+        // Recycle old row if it's the right size
+        sbrow = oldest;
+      } else {
+        if (oldest->info != NULL) {
+          free_lineinfo(oldest->info);
+        }
+        free(oldest);
       }
-      free(term->sb_buffer[term->sb_current - 1]);
     }
-
-    // Make room at the start by shifting to the right.
-    memmove(term->sb_buffer + 1, term->sb_buffer,
-            sizeof(term->sb_buffer[0]) * (term->sb_current - 1));
-
-  } else if (term->sb_current > 0) {
-    // Make room at the start by shifting to the right.
-    memmove(term->sb_buffer + 1, term->sb_buffer,
-            sizeof(term->sb_buffer[0]) * term->sb_current);
+    // Advance head to discard oldest entry
+    term->sb_head = (term->sb_head + 1) % term->sb_size;
+  } else {
+    term->sb_current++;
   }
 
   if (!sbrow) {
@@ -67,10 +346,12 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
     sbrow->cols = c;
     sbrow->info = NULL;
   }
+
   if (sbrow->info != NULL) {
     free_lineinfo(sbrow->info);
   }
   sbrow->info = term->lines[0];
+
   memmove(term->lines, term->lines + 1,
           sizeof(term->lines[0]) * (term->lines_len - 1));
   if (term->resizing) {
@@ -92,13 +373,11 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
     }
   }
 
-  // New row is added at the start of the storage buffer.
-  term->sb_buffer[0] = sbrow;
-  if (term->sb_current < term->sb_size) {
-    term->sb_current++;
-  }
+  // New row is added at tail position (O(1) operation)
+  term->sb_buffer[term->sb_tail] = sbrow;
+  term->sb_tail = (term->sb_tail + 1) % term->sb_size;
 
-  if (term->sb_pending < term->sb_size) {
+  if ((size_t)term->sb_pending < term->sb_size) {
     term->sb_pending++;
     /* when window height decreased */
     if (term->height_resize < 0 &&
@@ -127,11 +406,11 @@ static int term_sb_pop(int cols, VTermScreenCell *cells, void *data) {
     term->sb_pending--;
   }
 
-  ScrollbackLine *sbrow = term->sb_buffer[0];
+  // Pop newest entry from tail (O(1) instead of O(n) memmove)
+  term->sb_tail = (term->sb_tail + term->sb_size - 1) % term->sb_size;
+  ScrollbackLine *sbrow = term->sb_buffer[term->sb_tail];
+  term->sb_buffer[term->sb_tail] = NULL;
   term->sb_current--;
-  // Forget the "popped" row by shifting the rest onto it.
-  memmove(term->sb_buffer, term->sb_buffer + 1,
-          sizeof(term->sb_buffer[0]) * (term->sb_current));
 
   size_t cols_to_copy = (size_t)cols;
   if (cols_to_copy > sbrow->cols) {
@@ -166,17 +445,25 @@ static int term_sb_clear(void *data) {
     return 0;
   }
 
-  for (int i = 0; i < term->sb_current; i++) {
-    if (term->sb_buffer[i]->info != NULL) {
-      free_lineinfo(term->sb_buffer[i]->info);
-      term->sb_buffer[i]->info = NULL;
+  // Iterate over circular buffer using head/tail pointers
+  size_t idx = term->sb_head;
+  for (size_t i = 0; i < term->sb_current; i++) {
+    if (term->sb_buffer[idx] != NULL) {
+      if (term->sb_buffer[idx]->info != NULL) {
+        free_lineinfo(term->sb_buffer[idx]->info);
+        term->sb_buffer[idx]->info = NULL;
+      }
+      free(term->sb_buffer[idx]);
+      term->sb_buffer[idx] = NULL;
     }
-    free(term->sb_buffer[i]);
+    idx = (idx + 1) % term->sb_size;
   }
   free(term->sb_buffer);
   term->sb_buffer = malloc(sizeof(ScrollbackLine *) * term->sb_size);
   term->sb_clear_pending = true;
   term->sb_current = 0;
+  term->sb_head = 0;
+  term->sb_tail = 0;
   term->sb_pending = 0;
   term->sb_pending_by_height_decr = 0;
   invalidate_terminal(term, -1, -1);
@@ -192,10 +479,24 @@ static int linenr_to_row(Term *term, int linenr) {
   return linenr - (int)term->sb_current - 1;
 }
 
+/* Get scrollback line at logical index (0 = newest, sb_current-1 = oldest)
+ * Uses circular buffer indexing for O(1) access */
+VTERM_INLINE ScrollbackLine *get_scrollback_line(Term *term,
+                                                 size_t logical_idx) {
+  if (logical_idx >= term->sb_current)
+    return NULL;
+  /* tail points to next write position, so tail-1 is newest */
+  /* For logical_idx 0 (newest), we want (tail - 1) */
+  /* For logical_idx 1, we want (tail - 2), etc. */
+  size_t actual_idx =
+      (term->sb_tail + term->sb_size - 1 - logical_idx) % term->sb_size;
+  return term->sb_buffer[actual_idx];
+}
+
 static void fetch_cell(Term *term, int row, int col, VTermScreenCell *cell) {
   if (row < 0) {
-    ScrollbackLine *sbrow = term->sb_buffer[-row - 1];
-    if ((size_t)col < sbrow->cols) {
+    ScrollbackLine *sbrow = get_scrollback_line(term, (size_t)(-row - 1));
+    if (sbrow != NULL && (size_t)col < sbrow->cols) {
       *cell = sbrow->cells[col];
     } else {
       // fill the pointer with an empty cell
@@ -212,8 +513,8 @@ static void fetch_cell(Term *term, int row, int col, VTermScreenCell *cell) {
 
 static char *get_row_directory(Term *term, int row) {
   if (row < 0) {
-    ScrollbackLine *sbrow = term->sb_buffer[-row - 1];
-    if ( sbrow && sbrow->info && sbrow->info->directory ) {
+    ScrollbackLine *sbrow = get_scrollback_line(term, (size_t)(-row - 1));
+    if (sbrow && sbrow->info && sbrow->info->directory) {
       return sbrow->info->directory;
     } else {
       return NULL;
@@ -225,8 +526,8 @@ static char *get_row_directory(Term *term, int row) {
 }
 static LineInfo *get_lineinfo(Term *term, int row) {
   if (row < 0) {
-    ScrollbackLine *sbrow = term->sb_buffer[-row - 1];
-    return sbrow->info;
+    ScrollbackLine *sbrow = get_scrollback_line(term, (size_t)(-row - 1));
+    return sbrow ? sbrow->info : NULL;
     /* return term->dirs[0]; */
   } else {
     return term->lines[row];
@@ -239,9 +540,11 @@ static bool is_eol(Term *term, int end_col, int row, int col) {
     return vterm_screen_is_eol(term->vts, pos);
   }
 
-  ScrollbackLine *sbrow = term->sb_buffer[-row - 1];
+  ScrollbackLine *sbrow = get_scrollback_line(term, (size_t)(-row - 1));
+  if (sbrow == NULL)
+    return 1;
   int c;
-  for (c = col; c < end_col && c < sbrow->cols;) {
+  for (c = col; c < end_col && c < (int)sbrow->cols;) {
     if (sbrow->cells[c].chars[0]) {
       return 0;
     }
@@ -314,12 +617,26 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
     length++;                                                                  \
   } while (0)
 
+#define BATCH_CAPACITY 256
+#define PUSH_SEGMENT(seg)                                                      \
+  do {                                                                         \
+    if (batch_count >= BATCH_CAPACITY) {                                       \
+      insert_batch(env, batch, batch_count);                                   \
+      batch_count = 0;                                                         \
+    }                                                                          \
+    batch[batch_count++] = (seg);                                              \
+  } while (0)
+
   int capacity = ((end_row - start_row + 1) * end_col) * 4;
   int length = 0;
   char *buffer = malloc(capacity * sizeof(char));
   VTermScreenCell cell;
   VTermScreenCell lastCell;
   fetch_cell(term, start_row, 0, &lastCell);
+
+  /* Batch array for collecting segments before inserting */
+  emacs_value batch[BATCH_CAPACITY];
+  int batch_count = 0;
 
   for (i = start_row; i < end_row; i++) {
 
@@ -329,19 +646,19 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
       fetch_cell(term, i, j, &cell);
       if (isprompt && length > 0) {
         emacs_value text = render_text(env, term, buffer, length, &lastCell);
-        insert(env, render_prompt(env, text));
+        PUSH_SEGMENT(render_prompt(env, text));
         length = 0;
       }
 
       isprompt = is_end_of_prompt(term, end_col, i, j);
       if (isprompt && length > 0) {
-        insert(env, render_text(env, term, buffer, length, &lastCell));
+        PUSH_SEGMENT(render_text(env, term, buffer, length, &lastCell));
         length = 0;
       }
 
-      if (!compare_cells(&cell, &lastCell)) {
+      if (!fast_compare_cells(&cell, &lastCell)) {
         emacs_value text = render_text(env, term, buffer, length, &lastCell);
-        insert(env, text);
+        PUSH_SEGMENT(text);
         length = 0;
       }
 
@@ -371,23 +688,30 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
     }
     if (isprompt && length > 0) {
       emacs_value text = render_text(env, term, buffer, length, &lastCell);
-      insert(env, render_prompt(env, text));
+      PUSH_SEGMENT(render_prompt(env, text));
       length = 0;
       isprompt = 0;
     }
 
     if (!newline) {
       emacs_value text = render_text(env, term, buffer, length, &lastCell);
-      insert(env, text);
+      PUSH_SEGMENT(text);
       length = 0;
       text = render_fake_newline(env, term);
-      insert(env, text);
+      PUSH_SEGMENT(text);
     }
   }
   emacs_value text = render_text(env, term, buffer, length, &lastCell);
-  insert(env, text);
+  PUSH_SEGMENT(text);
+
+  /* Flush remaining batch */
+  if (batch_count > 0) {
+    insert_batch(env, batch, batch_count);
+  }
 
 #undef PUSH_BUFFER
+#undef PUSH_SEGMENT
+#undef BATCH_CAPACITY
   free(buffer);
 
   return;
@@ -808,8 +1132,8 @@ static emacs_value render_text(emacs_env *env, Term *term, char *buffer,
   emacs_value strike = cell->attrs.strike ? Qt : Qnil;
 
   // TODO: Blink, font, dwl, dhl is missing
-  int emacs_major_version =
-      env->extract_integer(env, symbol_value(env, Qemacs_major_version));
+  /* Use cached emacs_major_version instead of looking it up every call */
+  int emacs_major_version = cached_emacs_major_version;
   emacs_value properties;
   emacs_value props[64];
   int props_len = 0;
@@ -921,116 +1245,57 @@ static void term_clear_scrollback(Term *term, emacs_env *env) {
 
 static void term_process_key(Term *term, emacs_env *env, unsigned char *key,
                              size_t len, VTermModifier modifier) {
-  if (is_key(key, len, "<clear_scrollback>")) {
-    term_clear_scrollback(term, env);
-  } else if (is_key(key, len, "<start>")) {
+  /* Use hash-based O(1) key lookup instead of O(n) string comparisons */
+  KeyEntry *entry = lookup_key(key, len);
+
+  if (entry != NULL) {
+    /* Handle special keys that need custom logic */
+    switch (entry->type) {
+    case KEY_CLEAR_SCROLLBACK:
+      term_clear_scrollback(term, env);
+      return;
+    case KEY_START:
 #ifndef _WIN32
-    tcflow(term->pty_fd, TCOON);
+      tcflow(term->pty_fd, TCOON);
 #endif
-  } else if (is_key(key, len, "<stop>")) {
+      return;
+    case KEY_STOP:
 #ifndef _WIN32
-    tcflow(term->pty_fd, TCOOFF);
+      tcflow(term->pty_fd, TCOOFF);
 #endif
-  } else if (is_key(key, len, "<start_paste>")) {
-    vterm_keyboard_start_paste(term->vt);
-  } else if (is_key(key, len, "<end_paste>")) {
-    vterm_keyboard_end_paste(term->vt);
-  } else if (is_key(key, len, "<tab>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_TAB, modifier);
-  } else if (is_key(key, len, "<backtab>") ||
-             is_key(key, len, "<iso-lefttab>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_TAB, VTERM_MOD_SHIFT);
-  } else if (is_key(key, len, "<backspace>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_BACKSPACE, modifier);
-  } else if (is_key(key, len, "<escape>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_ESCAPE, modifier);
-  } else if (is_key(key, len, "<up>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_UP, modifier);
-  } else if (is_key(key, len, "<down>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_DOWN, modifier);
-  } else if (is_key(key, len, "<left>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_LEFT, modifier);
-  } else if (is_key(key, len, "<right>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_RIGHT, modifier);
-  } else if (is_key(key, len, "<insert>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_INS, modifier);
-  } else if (is_key(key, len, "<delete>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_DEL, modifier);
-  } else if (is_key(key, len, "<home>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_HOME, modifier);
-  } else if (is_key(key, len, "<end>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_END, modifier);
-  } else if (is_key(key, len, "<prior>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_PAGEUP, modifier);
-  } else if (is_key(key, len, "<next>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_PAGEDOWN, modifier);
-  } else if (is_key(key, len, "<f0>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(0), modifier);
-  } else if (is_key(key, len, "<f1>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(1), modifier);
-  } else if (is_key(key, len, "<f2>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(2), modifier);
-  } else if (is_key(key, len, "<f3>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(3), modifier);
-  } else if (is_key(key, len, "<f4>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(4), modifier);
-  } else if (is_key(key, len, "<f5>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(5), modifier);
-  } else if (is_key(key, len, "<f6>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(6), modifier);
-  } else if (is_key(key, len, "<f7>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(7), modifier);
-  } else if (is_key(key, len, "<f8>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(8), modifier);
-  } else if (is_key(key, len, "<f9>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(9), modifier);
-  } else if (is_key(key, len, "<f10>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(10), modifier);
-  } else if (is_key(key, len, "<f11>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(11), modifier);
-  } else if (is_key(key, len, "<f12>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_FUNCTION(12), modifier);
-  } else if (is_key(key, len, "<kp-0>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_0, modifier);
-  } else if (is_key(key, len, "<kp-1>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_1, modifier);
-  } else if (is_key(key, len, "<kp-2>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_2, modifier);
-  } else if (is_key(key, len, "<kp-3>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_3, modifier);
-  } else if (is_key(key, len, "<kp-4>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_4, modifier);
-  } else if (is_key(key, len, "<kp-5>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_5, modifier);
-  } else if (is_key(key, len, "<kp-6>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_6, modifier);
-  } else if (is_key(key, len, "<kp-7>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_7, modifier);
-  } else if (is_key(key, len, "<kp-8>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_8, modifier);
-  } else if (is_key(key, len, "<kp-9>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_9, modifier);
-  } else if (is_key(key, len, "<kp-add>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_PLUS, modifier);
-  } else if (is_key(key, len, "<kp-subtract>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_MINUS, modifier);
-  } else if (is_key(key, len, "<kp-multiply>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_MULT, modifier);
-  } else if (is_key(key, len, "<kp-divide>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_DIVIDE, modifier);
-  } else if (is_key(key, len, "<kp-equal>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_EQUAL, modifier);
-  } else if (is_key(key, len, "<kp-decimal>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_PERIOD, modifier);
-  } else if (is_key(key, len, "<kp-separator>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_COMMA, modifier);
-  } else if (is_key(key, len, "<kp-enter>")) {
-    vterm_keyboard_key(term->vt, VTERM_KEY_KP_ENTER, modifier);
-  } else if (is_key(key, len, "j") && (modifier == VTERM_MOD_CTRL)) {
+      return;
+    case KEY_START_PASTE:
+      vterm_keyboard_start_paste(term->vt);
+      return;
+    case KEY_END_PASTE:
+      vterm_keyboard_end_paste(term->vt);
+      return;
+    case KEY_BACKTAB:
+    case KEY_ISO_LEFTTAB:
+      /* backtab uses SHIFT modifier */
+      vterm_keyboard_key(term->vt, VTERM_KEY_TAB, VTERM_MOD_SHIFT);
+      return;
+    case KEY_SPC:
+      vterm_keyboard_unichar(term->vt, ' ', modifier);
+      return;
+    default:
+      /* All other keys with a direct vterm_key mapping */
+      if (entry->vterm_key != VTERM_KEY_NONE) {
+        vterm_keyboard_key(term->vt, entry->vterm_key, modifier);
+        return;
+      }
+      break;
+    }
+  }
+
+  /* Handle Ctrl+j -> newline */
+  if (len == 1 && key[0] == 'j' && (modifier == VTERM_MOD_CTRL)) {
     vterm_keyboard_unichar(term->vt, '\n', 0);
-  } else if (is_key(key, len, "SPC")) {
-    vterm_keyboard_unichar(term->vt, ' ', modifier);
-  } else if (len <= 4) {
+    return;
+  }
+
+  /* Fallback: try to decode as UTF-8 codepoint */
+  if (len <= 4) {
     uint32_t codepoint;
     if (utf8_to_codepoint(key, len, &codepoint)) {
       vterm_keyboard_unichar(term->vt, codepoint, modifier);
@@ -1040,12 +1305,17 @@ static void term_process_key(Term *term, emacs_env *env, unsigned char *key,
 
 void term_finalize(void *object) {
   Term *term = (Term *)object;
-  for (int i = 0; i < term->sb_current; i++) {
-    if (term->sb_buffer[i]->info != NULL) {
-      free_lineinfo(term->sb_buffer[i]->info);
-      term->sb_buffer[i]->info = NULL;
+  // Iterate over circular buffer using head/tail pointers
+  size_t idx = term->sb_head;
+  for (size_t i = 0; i < term->sb_current; i++) {
+    if (term->sb_buffer[idx] != NULL) {
+      if (term->sb_buffer[idx]->info != NULL) {
+        free_lineinfo(term->sb_buffer[idx]->info);
+        term->sb_buffer[idx]->info = NULL;
+      }
+      free(term->sb_buffer[idx]);
     }
-    free(term->sb_buffer[i]);
+    idx = (idx + 1) % term->sb_size;
   }
   if (term->title) {
     free(term->title);
@@ -1200,7 +1470,8 @@ static int osc_callback(int cmd, VTermStringFragment frag, void *user) {
     }
   }
 
-  /* frag.len can be -1 (invalid) for sequences such as "\033];\033". https://github.com/akermu/emacs-libvterm/issues/729 */
+  /* frag.len can be -1 (invalid) for sequences such as "\033];\033".
+   * https://github.com/akermu/emacs-libvterm/issues/729 */
   /* This might be a bug in libvterm. */
   frag.len = (frag.len == INVALID_STRING_FRAGMENT_LEN) ? 0 : frag.len;
 
@@ -1295,6 +1566,8 @@ emacs_value Fvterm_new(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   term->sb_clear_pending = false;
   term->sb_pending_by_height_decr = 0;
   term->sb_buffer = malloc(sizeof(ScrollbackLine *) * term->sb_size);
+  term->sb_head = 0;
+  term->sb_tail = 0;
   term->invalid_start = 0;
   term->invalid_end = rows;
   term->is_invalidated = false;
@@ -1423,7 +1696,7 @@ emacs_value Fvterm_set_size(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 emacs_value Fvterm_set_pty_name(emacs_env *env, ptrdiff_t nargs,
                                 emacs_value args[], void *data) {
 #ifndef _WIN32
-    Term *term = env->get_user_ptr(env, args[0]);
+  Term *term = env->get_user_ptr(env, args[0]);
 
   if (nargs > 1) {
     ptrdiff_t len = string_bytes(env, args[1]);
@@ -1588,6 +1861,10 @@ int emacs_module_init(struct emacs_runtime *ert) {
   fun = env->make_function(env, 1, 1, Fvterm_get_icrnl,
                            "Get the icrnl state of the pty", NULL);
   bind_function(env, "vterm--get-icrnl", fun);
+
+  /* Cache the Emacs major version for performance */
+  cached_emacs_major_version =
+      env->extract_integer(env, symbol_value(env, Qemacs_major_version));
 
   provide(env, "vterm-module");
 

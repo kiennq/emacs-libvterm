@@ -21,6 +21,19 @@
 #endif
 #endif
 
+/* Inline hint for hot functions - improves performance on critical paths */
+#if defined(__GNUC__) || defined(__clang__)
+#define VTERM_INLINE static inline __attribute__((always_inline))
+#define VTERM_HOT __attribute__((hot))
+#define VTERM_LIKELY(x) __builtin_expect(!!(x), 1)
+#define VTERM_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define VTERM_INLINE static inline
+#define VTERM_HOT
+#define VTERM_LIKELY(x) (x)
+#define VTERM_UNLIKELY(x) (x)
+#endif
+
 VTERM_EXPORT int plugin_is_GPL_compatible;
 
 #ifndef SB_MAX
@@ -72,9 +85,12 @@ typedef struct Term {
   // buffer used to:
   //  - convert VTermScreen cell arrays into utf8 strings
   //  - receive data from libvterm as a result of key presses.
-  ScrollbackLine **sb_buffer; // Scrollback buffer storage for libvterm
-  size_t sb_current;          // number of rows pushed to sb_buffer
-  size_t sb_size;             // sb_buffer size
+  ScrollbackLine *
+      *sb_buffer;    // Scrollback buffer storage for libvterm (circular buffer)
+  size_t sb_current; // number of rows pushed to sb_buffer
+  size_t sb_size;    // sb_buffer size
+  size_t sb_head;    // head index for circular buffer (oldest entry)
+  size_t sb_tail;    // tail index for circular buffer (newest entry)
   // "virtual index" that points to the first sb_buffer row that we need to
   // push to the terminal buffer when refreshing the scrollback. When negative,
   // it actually points to entries that are no longer in sb_buffer (because the
