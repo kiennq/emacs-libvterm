@@ -73,10 +73,22 @@ else()
 
   # libtermiwin is only needed on Windows for terminal compatibility
   if(WIN32)
+    # Create a patch script to fix ssize_t typedef conflict on ARM64
+    # termiWin hardcodes "typedef int ssize_t" but on ARM64, ssize_t is already defined as __int64
+    file(WRITE ${CMAKE_BINARY_DIR}/fix_ssize_t.cmake "
+      file(READ \${SOURCE_DIR}/include/termiWin.h TERMIWIN_H_CONTENT)
+      string(REPLACE
+        \"typedef int ssize_t;        /* common 32 bit case */\"
+        \"#ifndef _SSIZE_T_DEFINED\\ntypedef int ssize_t;        /* common 32 bit case */\\n#define _SSIZE_T_DEFINED\\n#endif\"
+        TERMIWIN_H_CONTENT \"\${TERMIWIN_H_CONTENT}\")
+      file(WRITE \${SOURCE_DIR}/include/termiWin.h \"\${TERMIWIN_H_CONTENT}\")
+    ")
+
     ExternalProject_add(libtermiwin
       GIT_REPOSITORY https://github.com/steeviebops/termiWin
       GIT_TAG 5d5f3474ab823e2c491159cf979ae9fc73f57f9a
       BUILD_BYPRODUCTS <BINARY_DIR>/libtermiwin.a
+      PATCH_COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=<SOURCE_DIR> -P ${CMAKE_BINARY_DIR}/fix_ssize_t.cmake
       INSTALL_COMMAND "")
 
     ExternalProject_Get_property(libtermiwin SOURCE_DIR)
