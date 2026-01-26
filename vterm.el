@@ -144,43 +144,74 @@ the executable."
 
 ;;;###autoload
 (defun vterm-ensure-binary (&optional forced)
-  "Ensure the vterm module binarines.
+  "Ensure the vterm module binaries.
 Will redownload if FORCED.
-Currently only applicable for Windows."
+Supports Windows and Linux platforms with x86_64 and aarch64 architectures."
   (interactive "P")
   (when-let* ((default-directory (or vterm-binaries-dir (file-name-directory (find-library-name "vterm.el"))))
-              (_ (and (eq system-type 'windows-nt)
+              (_ (and (memq system-type '(windows-nt gnu/linux))
                       (or forced
                           (not (file-exists-p (expand-file-name
                                                (format "vterm-module%s" module-file-suffix))))))))
-    (let* ((bin-file "vterm-x86_64-windows.zip")
+    (let* ((arch (car (split-string system-configuration "-")))
+           (arch-name (pcase arch
+                        ((or "x86_64" "amd64") "x86_64")
+                        ((or "aarch64" "arm64") "aarch64")
+                        (_ arch)))
+           (os-name (pcase system-type
+                      ('windows-nt "windows")
+                      ('gnu/linux "linux")
+                      (_ (symbol-name system-type))))
+           (bin-file (format "vterm-module-%s-%s.zip" arch-name os-name))
            (url (format vterm-binaries-download-url bin-file))
            (exec-path (append exec-path `(,(expand-file-name
                                             (concat exec-directory "../../../../bin"))))))
       (unless (file-directory-p default-directory)
         (make-directory default-directory 'parents))
-      ;; move all *.exe and *.dll files to *.old on Windows
-      (dolist (f (directory-files default-directory t "\\.\\(exe\\|dll\\)\\'"))
-        (ignore-errors
-          (rename-file f (concat f ".old") 'ok-if-already-exists)))
+      ;; Backup existing binaries
+      (let ((ext-pattern (pcase system-type
+                           ('windows-nt "\\.\\(exe\\|dll\\)\\'")
+                           ('gnu/linux "\\.so\\'"))))
+        (dolist (f (directory-files default-directory t ext-pattern))
+          (ignore-errors
+            (rename-file f (concat f ".old") 'ok-if-already-exists))))
+      (message "Downloading vterm binary from %s..." url)
       (url-copy-file url bin-file 'ok-if-already-exists)
-      (call-process "tar" nil nil nil "xf" bin-file))))
+      (call-process "tar" nil nil nil "xf" bin-file)
+      (delete-file bin-file)
+      (message "vterm binary installed successfully."))))
 
-;; If the vterm-module is not compiled yet, compile it
+;; If the vterm-module is not compiled yet, try to download or compile it
 (unless (require 'vterm-module
                  (when vterm-binaries-dir
                    (expand-file-name (format "vterm-module%s" module-file-suffix)
                                      vterm-binaries-dir))
                  t)
   (cond
-   ((eq system-type 'windows-nt)
-    (vterm-ensure-binary)
-    (require 'vterm-module
-             (when vterm-binaries-dir
-               (expand-file-name (format "vterm-module%s" module-file-suffix)
-                                 vterm-binaries-dir))))
+   ;; Windows and Linux: try downloading prebuilt binaries first
+   ((memq system-type '(windows-nt gnu/linux))
+    (condition-case err
+        (progn
+          (vterm-ensure-binary)
+          (require 'vterm-module
+                   (when vterm-binaries-dir
+                     (expand-file-name (format "vterm-module%s" module-file-suffix)
+                                       vterm-binaries-dir))))
+      (error
+       ;; If download fails on Linux, fall back to compilation
+       (if (eq system-type 'gnu/linux)
+           (if (or vterm-always-compile-module
+                   (y-or-n-p (format "Download failed (%s). Compile vterm-module instead? "
+                                     (error-message-string err))))
+               (progn
+                 (vterm-module-compile)
+                 (require 'vterm-module))
+             (error "Vterm will not work until `vterm-module' is compiled!"))
+         ;; On Windows, re-raise the error
+         (signal (car err) (cdr err))))))
+   ;; Other platforms: compile from source
    ((or vterm-always-compile-module
-          (y-or-n-p "Vterm needs `vterm-module' to work.  Compile it now? "))
+        (y-or-n-p "Vterm needs `vterm-module' to work.  Compile it now? "))
     (vterm-module-compile)
     (require 'vterm-module))
    (t
