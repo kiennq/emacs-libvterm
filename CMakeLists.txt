@@ -110,6 +110,8 @@ else()
       BUILD_IN_SOURCE ON
       BUILD_BYPRODUCTS <SOURCE_DIR>/.libs/libvterm.a
       INSTALL_COMMAND "")
+
+    add_dependencies(vterm-module libvterm)
   endif()
 
   ExternalProject_Get_property(libvterm SOURCE_DIR)
