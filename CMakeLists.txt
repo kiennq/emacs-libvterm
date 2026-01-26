@@ -71,39 +71,51 @@ else()
     message(FATAL_ERROR "libtool not found. Please install libtool")
   endif()
 
-  ExternalProject_add(libtermiwin
-    GIT_REPOSITORY https://github.com/steeviebops/termiWin
-    GIT_TAG 5d5f3474ab823e2c491159cf979ae9fc73f57f9a
-    BUILD_BYPRODUCTS <BINARY_DIR>/libtermiwin.a
-    INSTALL_COMMAND "")
+  # libtermiwin is only needed on Windows for terminal compatibility
+  if(WIN32)
+    ExternalProject_add(libtermiwin
+      GIT_REPOSITORY https://github.com/steeviebops/termiWin
+      GIT_TAG 5d5f3474ab823e2c491159cf979ae9fc73f57f9a
+      BUILD_BYPRODUCTS <BINARY_DIR>/libtermiwin.a
+      INSTALL_COMMAND "")
 
-  ExternalProject_Get_property(libtermiwin SOURCE_DIR)
-  ExternalProject_Get_property(libtermiwin BINARY_DIR)
+    ExternalProject_Get_property(libtermiwin SOURCE_DIR)
+    ExternalProject_Get_property(libtermiwin BINARY_DIR)
 
-  set(LIBTERMIWIN_INCLUDE_DIR ${SOURCE_DIR}/include)
-  set(LIBTERMIWIN_LIBRARY_DIR ${BINARY_DIR})
-  set(LIBTERMIWIN_LIBRARY ${BINARY_DIR}/libtermiwin.a)
+    set(LIBTERMIWIN_INCLUDE_DIR ${SOURCE_DIR}/include)
+    set(LIBTERMIWIN_LIBRARY_DIR ${BINARY_DIR})
+    set(LIBTERMIWIN_LIBRARY ${BINARY_DIR}/libtermiwin.a)
 
-  # Workaround for https://gitlab.kitware.com/cmake/cmake/issues/15052
-  file(MAKE_DIRECTORY ${LIBTERMIWIN_INCLUDE_DIR})
+    # Workaround for https://gitlab.kitware.com/cmake/cmake/issues/15052
+    file(MAKE_DIRECTORY ${LIBTERMIWIN_INCLUDE_DIR})
 
-  ExternalProject_add(libvterm
-    GIT_REPOSITORY https://github.com/neovim/libvterm.git
-    GIT_TAG dfc4c5e5b3dd99247dc95031a8f40087f181dea5
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${LIBVTERM_BUILD_COMMAND} "CFLAGS=-fPIC -I${LIBTERMIWIN_INCLUDE_DIR}" "LDFLAGS=-static -L${LIBTERMIWIN_LIBRARY_DIR} -ltermiwin"
-    BUILD_IN_SOURCE ON
-    BUILD_BYPRODUCTS <SOURCE_DIR>/.libs/libvterm.a
-    INSTALL_COMMAND "")
+    ExternalProject_add(libvterm
+      GIT_REPOSITORY https://github.com/neovim/libvterm.git
+      GIT_TAG dfc4c5e5b3dd99247dc95031a8f40087f181dea5
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ${LIBVTERM_BUILD_COMMAND} "CFLAGS=-fPIC -I${LIBTERMIWIN_INCLUDE_DIR}" "LDFLAGS=-static -L${LIBTERMIWIN_LIBRARY_DIR} -ltermiwin"
+      BUILD_IN_SOURCE ON
+      BUILD_BYPRODUCTS <SOURCE_DIR>/.libs/libvterm.a
+      INSTALL_COMMAND "")
+
+    add_dependencies(libvterm libtermiwin)
+    add_dependencies(vterm-module libtermiwin)
+  else()
+    # On non-Windows platforms, build libvterm without termiwin
+    ExternalProject_add(libvterm
+      GIT_REPOSITORY https://github.com/neovim/libvterm.git
+      GIT_TAG dfc4c5e5b3dd99247dc95031a8f40087f181dea5
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ${LIBVTERM_BUILD_COMMAND} "CFLAGS=-fPIC"
+      BUILD_IN_SOURCE ON
+      BUILD_BYPRODUCTS <SOURCE_DIR>/.libs/libvterm.a
+      INSTALL_COMMAND "")
+  endif()
 
   ExternalProject_Get_property(libvterm SOURCE_DIR)
 
   set(LIBVTERM_INCLUDE_DIR ${SOURCE_DIR}/include)
   set(LIBVTERM_LIBRARY ${SOURCE_DIR}/.libs/libvterm.a)
-
-  add_dependencies(libvterm libtermiwin)
-  # add_dependencies(vterm-module libvterm)
-  add_dependencies(vterm-module libtermiwin)
 
   # Workaround for https://gitlab.kitware.com/cmake/cmake/issues/15052
   file(MAKE_DIRECTORY ${LIBVTERM_INCLUDE_DIR})
@@ -123,16 +135,19 @@ if(WIN32)
 
 endif()
 
-add_library(termiwin STATIC IMPORTED)
-set_target_properties(termiwin PROPERTIES IMPORTED_LOCATION ${LIBTERMIWIN_LIBRARY})
-target_include_directories(termiwin INTERFACE ${LIBTERMIWIN_INCLUDE_DIR})
-
 add_library(vterm STATIC IMPORTED)
 set_target_properties(vterm PROPERTIES IMPORTED_LOCATION ${LIBVTERM_LIBRARY})
 target_include_directories(vterm INTERFACE ${LIBVTERM_INCLUDE_DIR})
 
-# Link with libvterm
-target_link_libraries(vterm-module PUBLIC vterm termiwin)
+# Link with libvterm (and termiwin on Windows)
+if(WIN32)
+  add_library(termiwin STATIC IMPORTED)
+  set_target_properties(termiwin PROPERTIES IMPORTED_LOCATION ${LIBTERMIWIN_LIBRARY})
+  target_include_directories(termiwin INTERFACE ${LIBTERMIWIN_INCLUDE_DIR})
+  target_link_libraries(vterm-module PUBLIC vterm termiwin)
+else()
+  target_link_libraries(vterm-module PUBLIC vterm)
+endif()
 
 # Custom run command for testing
 add_custom_target(run
