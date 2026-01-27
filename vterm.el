@@ -687,6 +687,9 @@ Only background is used."
 (defvar-local vterm--copy-mode-fake-newlines nil)
 (defvar-local vterm--directory-cache nil
   "Cache for directory existence checks to improve performance on Windows.")
+(defvar-local vterm--conpty-ctrl-process nil
+  "Persistent control process for sending resize commands to ConPTY on Windows.
+This avoids spawning a new process on every resize.")
 
 (define-obsolete-variable-alias 'vterm--redraw-immididately 'vterm--redraw-immediately "2025-07-15")
 
@@ -1594,13 +1597,24 @@ If not found in PATH, look in the vterm.el directory."
     conpty-process))
 
 (defun vterm--conpty-proxy-resize(proc width height)
-  "Call conpty proxy resize command."
-  ;; debounce creating new process by using timer
+  "Send resize command to ConPTY proxy via control pipe.
+
+IMPLEMENTATION NOTE:
+On Windows, this uses vterm--conpty-resize-pipe (if available) to write
+directly to the named pipe without spawning a process. Falls back to
+spawning conpty-proxy.exe resize if the C function is not available or fails.
+
+The resize is debounced by `vterm--conpty-proxy-debounce-resize` to avoid
+excessive calls during rapid window resizing."
   (let ((conpty-id (process-get proc 'conpty-id)))
-    (make-process
-     :name "vterm-resize"
-     :command `(,(vterm--conpty-proxy-path) "resize"
-                ,conpty-id ,(int-to-string width) ,(int-to-string height))))
+    ;; Try direct pipe write first (requires vterm-module with Windows support)
+    (unless (and (fboundp 'vterm--conpty-resize-pipe)
+                 (vterm--conpty-resize-pipe conpty-id width height))
+      ;; Fallback: spawn helper process (original behavior)
+      (make-process
+       :name "vterm-resize"
+       :command `(,(vterm--conpty-proxy-path) "resize"
+                  ,conpty-id ,(int-to-string width) ,(int-to-string height)))))
   (cons width height))
 
 (defvar-local vterm--conpty-proxy-resize-timer nil
