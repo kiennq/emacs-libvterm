@@ -9,7 +9,14 @@ else()
    set(LIBVTERM_BUILD_COMMAND "make")
 endif()
 
-add_library(vterm-module MODULE vterm-module.c utf8.c elisp.c)
+# Add source files based on platform
+if(WIN32)
+  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c conpty-proxy/arena.c)
+else()
+  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c)
+endif()
+
+add_library(vterm-module MODULE ${VTERM_MODULE_SOURCES})
 set_target_properties(vterm-module PROPERTIES
   C_STANDARD 99
   C_VISIBILITY_PRESET "hidden"
