@@ -138,12 +138,6 @@ endif()
 # Build conpty-proxy from local source
 if(WIN32)
   add_subdirectory(conpty-proxy)
-  add_custom_command(TARGET conpty_proxy POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-    $<TARGET_FILE:conpty_proxy>
-    ${CMAKE_CURRENT_SOURCE_DIR}/conpty_proxy.exe
-    COMMENT "Copying conpty_proxy.exe to source directory"
-  )
 endif()
 
 add_library(vterm STATIC IMPORTED)
