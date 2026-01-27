@@ -685,14 +685,17 @@ Only background is used."
 (defvar-local vterm--delete-region-function (symbol-function #'delete-region))
 (defvar-local vterm--undecoded-bytes nil)
 (defvar-local vterm--copy-mode-fake-newlines nil)
+(defvar-local vterm--directory-cache nil
+  "Cache for directory existence checks to improve performance on Windows.")
 
 (define-obsolete-variable-alias 'vterm--redraw-immididately 'vterm--redraw-immediately "2025-07-15")
 
-(defvar vterm-timer-delay 0.1
+(defvar vterm-timer-delay (if (eq system-type 'windows-nt) 0.2 0.1)
   "Delay for refreshing the buffer after receiving updates from libvterm.
 
-A larger delary improves performance when receiving large bursts
-of data.  If nil, never delay.  The units are seconds.")
+A larger delay improves performance when receiving large bursts
+of data.  If nil, never delay.  The units are seconds.
+On Windows, defaults to 0.2s for better performance; 0.1s on other platforms.")
 
 ;;; Keybindings
 
@@ -1865,23 +1868,32 @@ If N is negative backward-line from end of buffer."
     (when dir (setq default-directory dir))))
 
 (defun vterm--get-directory (path)
-  "Get normalized directory to PATH."
+  "Get normalized directory to PATH.
+Uses a cache to avoid repeated filesystem checks on Windows."
   (when path
-    (let (directory)
-      (if (string-match "^\\(.*?\\)@\\(.*?\\):\\(.*?\\)$" path)
-          (progn
-            (let ((user (match-string 1 path))
-                  (host (match-string 2 path))
-                  (dir (match-string 3 path)))
-              (if (and (string-equal user user-login-name)
-                       (string-equal host (system-name)))
-                  (progn
-                    (when (file-directory-p dir)
-                      (setq directory (file-name-as-directory dir))))
-                (setq directory (file-name-as-directory (concat "/-:" path))))))
-        (when (file-directory-p path)
-          (setq directory (file-name-as-directory path))))
-      directory)))
+    ;; Check cache first (especially beneficial on Windows)
+    (or (and (eq system-type 'windows-nt)
+             (cdr (assoc path vterm--directory-cache)))
+        (let (directory)
+          (if (string-match "^\\(.*?\\)@\\(.*?\\):\\(.*?\\)$" path)
+              (progn
+                (let ((user (match-string 1 path))
+                      (host (match-string 2 path))
+                      (dir (match-string 3 path)))
+                  (if (and (string-equal user user-login-name)
+                           (string-equal host (system-name)))
+                      (progn
+                        (when (file-directory-p dir)
+                          (setq directory (file-name-as-directory dir))))
+                    (setq directory (file-name-as-directory (concat "/-:" path))))))
+            (when (file-directory-p path)
+              (setq directory (file-name-as-directory path))))
+          ;; Cache the result on Windows (limit cache size to 100 entries)
+          (when (and (eq system-type 'windows-nt) directory)
+            (when (> (length vterm--directory-cache) 100)
+              (setq vterm--directory-cache (cdr vterm--directory-cache)))
+            (push (cons path directory) vterm--directory-cache))
+          directory))))
 
 (defun vterm--get-pwd (&optional linenum)
   "Get working directory at LINENUM."
