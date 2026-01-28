@@ -6,6 +6,10 @@
 #include <stdbool.h>
 #include <vterm.h>
 
+#ifdef _WIN32
+#include "conpty-proxy/arena.h"
+#endif
+
 // https://gcc.gnu.org/wiki/Visibility
 #if defined _WIN32 || defined __CYGWIN__
 #ifdef __GNUC__
@@ -140,6 +144,13 @@ typedef struct Term {
   char *cmd_buffer;
 
   int pty_fd;
+
+#ifdef _WIN32
+  // Arena allocators for Windows performance optimization
+  arena_allocator_t
+      *persistent_arena;         // Long-lived data (LineInfo, directories)
+  arena_allocator_t *temp_arena; // Temporary render buffers (reset per frame)
+#endif
 } Term;
 
 static bool compare_cells(VTermScreenCell *a, VTermScreenCell *b);
