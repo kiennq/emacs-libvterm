@@ -886,7 +886,9 @@ static int term_resize(int rows, int cols, void *user_data) {
   term->height = rows;
 
   invalidate_terminal(term, -1, -1);
-  term->resizing = false;
+  /* Note: term->resizing is reset in Fvterm_set_size after term_redraw,
+     not here, because vterm_screen_flush_damage may trigger term_sb_push
+     which needs to know we're still resizing. */
 
   return 1;
 }
@@ -981,6 +983,9 @@ static void adjust_topline(Term *term, emacs_env *env) {
 
 static void invalidate_terminal(Term *term, int start_row, int end_row) {
   if (start_row != -1 && end_row != -1) {
+    /* Clamp to valid range to prevent out-of-bounds access during resize */
+    start_row = MAX(0, MIN(start_row, term->height));
+    end_row = MAX(0, MIN(end_row, term->height));
     term->invalid_start = MIN(term->invalid_start, start_row);
     term->invalid_end = MAX(term->invalid_end, end_row);
   }
@@ -1852,6 +1857,7 @@ emacs_value Fvterm_set_size(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
     vterm_screen_flush_damage(term->vts);
 
     term_redraw(term, env);
+    term->resizing = false; /* Reset after all resize operations complete */
   }
 
   return Qnil;

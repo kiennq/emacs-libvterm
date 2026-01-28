@@ -1568,6 +1568,12 @@ Argument BUFFER the terminal buffer."
             (windows (get-buffer-window-list)))
         (setq vterm--redraw-timer nil)
         (when vterm--term
+          ;; Lazy DPI check: if char dimensions changed, trigger resize
+          (let ((char-height (frame-char-height))
+                (char-width (frame-char-width)))
+            (when (or (not (eql char-height vterm--last-char-height))
+                      (not (eql char-width vterm--last-char-width)))
+              (window--adjust-process-windows)))
           (vterm--redraw vterm--term)
           (unless (zerop (window-hscroll))
             (when (cl-member (selected-window) windows :test #'eq)
@@ -1651,16 +1657,41 @@ excessive calls during rapid window resizing."
 (defvar-local vterm--conpty-proxy-resize-timer nil
   "Timer for conpty proxy resize.")
 
+(defvar-local vterm--pending-resize nil
+  "Pending resize dimensions (width . height) waiting for debounce.")
+
 (defun vterm--conpty-proxy-debounce-resize (width height)
-  "Debounce conpty proxy resize calls."
+  "Debounce conpty proxy resize calls.
+On Windows, both libvterm and ConPTY resize are debounced together
+to prevent sync issues where libvterm expects new size but ConPTY
+still sends output formatted for old size."
   (when (timerp vterm--conpty-proxy-resize-timer)
     (cancel-timer vterm--conpty-proxy-resize-timer))
+  ;; Store pending resize - libvterm resize is deferred on Windows
+  (setq vterm--pending-resize (cons width height))
   (setq vterm--conpty-proxy-resize-timer
         (run-with-timer
          vterm-timer-delay nil
-         (lambda (proc w h) (vterm--conpty-proxy-resize proc w h))
-         vterm--process width height))
+         #'vterm--apply-pending-resize
+         (current-buffer)))
   (cons width height))
+
+(defun vterm--apply-pending-resize (buffer)
+  "Apply pending resize to both libvterm and ConPTY.
+This ensures both are resized atomically to prevent sync issues."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and vterm--pending-resize vterm--term vterm--process)
+        (let ((width (car vterm--pending-resize))
+              (height (cdr vterm--pending-resize)))
+          ;; Resize libvterm first
+          (vterm--set-size vterm--term height width)
+          ;; Then resize ConPTY
+          (vterm--conpty-proxy-resize vterm--process width height)
+          ;; Update tracked dimensions
+          (setq vterm--last-width width
+                vterm--last-height height)
+          (setq vterm--pending-resize nil))))))
 
 ;;; Entry Points
 
@@ -1839,6 +1870,8 @@ Argument EVENT process event."
 
 (defvar-local vterm--last-width 0 "Last width set to libvterm.")
 (defvar-local vterm--last-height 0 "Last height set to libvterm.")
+(defvar-local vterm--last-char-height nil "Last frame char height for DPI change detection.")
+(defvar-local vterm--last-char-width nil "Last frame char width for DPI change detection.")
 
 (defun vterm--window-adjust-process-window-size (process windows)
   "Adjust width of window WINDOWS associated to process PROCESS.
@@ -1853,21 +1886,33 @@ Argument EVENT process event."
                           process windows))
            (width (car size))
            (height (cdr size))
-           (inhibit-read-only t))
+           (inhibit-read-only t)
+           ;; Detect DPI/font changes via character dimension tracking
+           (char-height (frame-char-height))
+           (char-width (frame-char-width))
+           (dpi-changed (or (not (eql char-height vterm--last-char-height))
+                            (not (eql char-width vterm--last-char-width)))))
       (setq width (- width (vterm--get-margin-width)))
       (setq width (max width vterm-min-window-width))
+      ;; Update character dimension tracking
+      (setq vterm--last-char-height char-height
+            vterm--last-char-width char-width)
       (when (and (processp process)
                  (process-live-p process)
                  (> width 0)
                  (> height 0)
-                 (or (/= width vterm--last-width)
+                 (or dpi-changed  ; Force resize on DPI/font change
+                     (/= width vterm--last-width)
                      ;; small chaneg in height might caused by minibuffer, we skip it
                      (> (abs (- height vterm--last-height)) 1)))
-        (vterm--set-size vterm--term height width)
-        (when (eq system-type 'windows-nt)
-          (vterm--conpty-proxy-debounce-resize width height))
-        (setq vterm--last-width width
-              vterm--last-height height)
+        (if (eq system-type 'windows-nt)
+            ;; Windows: debounce both libvterm and ConPTY resize together
+            ;; to prevent sync issues (libvterm resize is deferred)
+            (vterm--conpty-proxy-debounce-resize width height)
+          ;; Other platforms: resize libvterm immediately
+          (vterm--set-size vterm--term height width)
+          (setq vterm--last-width width
+                vterm--last-height height))
         (cons width height)))))
 
 (defun vterm--get-margin-width ()
