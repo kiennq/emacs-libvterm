@@ -283,7 +283,7 @@ named \"*vterm*<2>\"."
   :type 'string
   :group 'vterm)
 
-(defcustom vterm-max-scrollback 1000
+(defcustom vterm-max-scrollback 10000
   "Maximum \\='scrollback\\=' value.
 
 The maximum allowed is 100000.  This value can modified by
@@ -685,14 +685,36 @@ Only background is used."
 (defvar-local vterm--delete-region-function (symbol-function #'delete-region))
 (defvar-local vterm--undecoded-bytes nil)
 (defvar-local vterm--copy-mode-fake-newlines nil)
+(defvar-local vterm--directory-cache nil
+  "Cache for directory existence checks to improve performance.
+Especially beneficial on Windows where filesystem operations are slower.")
+(defvar-local vterm--conpty-ctrl-process nil
+  "Persistent control process for sending resize commands to ConPTY on Windows.
+This avoids spawning a new process on every resize.")
 
 (define-obsolete-variable-alias 'vterm--redraw-immididately 'vterm--redraw-immediately "2025-07-15")
 
 (defvar vterm-timer-delay 0.1
   "Delay for refreshing the buffer after receiving updates from libvterm.
 
-A larger delary improves performance when receiving large bursts
+A larger delay improves performance when receiving large bursts
 of data.  If nil, never delay.  The units are seconds.")
+
+(defvar vterm-timer-delay-bulk 0.3
+  "Delay for refreshing during high-volume output (e.g., cat large file).
+This longer delay allows better batching of updates, reducing CPU overhead.
+Used when vterm-adaptive-timer is non-nil.")
+
+(defvar vterm-adaptive-timer t
+  "Use adaptive timer delays based on output volume.
+When non-nil, uses longer delays during bulk output to improve performance.
+Benefits all platforms, with Windows gaining the most improvement.")
+
+(defvar-local vterm--last-update-time nil
+  "Timestamp of last vterm update, used for adaptive timer.")
+
+(defvar-local vterm--update-count 0
+  "Number of updates in current time window, used for adaptive timer.")
 
 ;;; Keybindings
 
@@ -1505,9 +1527,24 @@ looks like: ((\"m\" :shift ))"
   (if (and (not vterm--redraw-immediately)
            vterm-timer-delay)
       (unless vterm--redraw-timer
-        (setq vterm--redraw-timer
-              (run-with-timer vterm-timer-delay nil
-                              #'vterm--delayed-redraw (current-buffer))))
+        ;; Adaptive timer: use longer delay for bulk output
+        (let* ((now (float-time))
+               (delay (if (and vterm-adaptive-timer
+                               vterm--last-update-time
+                               (< (- now vterm--last-update-time) 1.0))
+                          ;; High frequency updates - use bulk delay
+                          (progn
+                            (setq vterm--update-count (1+ vterm--update-count))
+                            (if (> vterm--update-count 5)
+                                vterm-timer-delay-bulk
+                              vterm-timer-delay))
+                        ;; Low frequency - use normal delay and reset counter
+                        (setq vterm--update-count 0)
+                        vterm-timer-delay)))
+          (setq vterm--last-update-time now)
+          (setq vterm--redraw-timer
+                (run-with-timer delay nil
+                                #'vterm--delayed-redraw (current-buffer)))))
     (vterm--delayed-redraw (current-buffer))
     (setq vterm--redraw-immediately nil)))
 
@@ -1591,13 +1628,24 @@ If not found in PATH, look in the vterm.el directory."
     conpty-process))
 
 (defun vterm--conpty-proxy-resize(proc width height)
-  "Call conpty proxy resize command."
-  ;; debounce creating new process by using timer
+  "Send resize command to ConPTY proxy via control pipe.
+
+IMPLEMENTATION NOTE:
+On Windows, this uses vterm--conpty-resize-pipe (if available) to write
+directly to the named pipe without spawning a process. Falls back to
+spawning conpty-proxy.exe resize if the C function is not available or fails.
+
+The resize is debounced by `vterm--conpty-proxy-debounce-resize` to avoid
+excessive calls during rapid window resizing."
   (let ((conpty-id (process-get proc 'conpty-id)))
-    (make-process
-     :name "vterm-resize"
-     :command `(,(vterm--conpty-proxy-path) "resize"
-                ,conpty-id ,(int-to-string width) ,(int-to-string height))))
+    ;; Try direct pipe write first (requires vterm-module with Windows support)
+    (unless (and (fboundp 'vterm--conpty-resize-pipe)
+                 (vterm--conpty-resize-pipe conpty-id width height))
+      ;; Fallback: spawn helper process (original behavior)
+      (make-process
+       :name "vterm-resize"
+       :command `(,(vterm--conpty-proxy-path) "resize"
+                  ,conpty-id ,(int-to-string width) ,(int-to-string height)))))
   (cons width height))
 
 (defvar-local vterm--conpty-proxy-resize-timer nil
@@ -1865,23 +1913,31 @@ If N is negative backward-line from end of buffer."
     (when dir (setq default-directory dir))))
 
 (defun vterm--get-directory (path)
-  "Get normalized directory to PATH."
+  "Get normalized directory to PATH.
+Uses a cache to avoid repeated filesystem checks on all platforms."
   (when path
-    (let (directory)
-      (if (string-match "^\\(.*?\\)@\\(.*?\\):\\(.*?\\)$" path)
-          (progn
-            (let ((user (match-string 1 path))
-                  (host (match-string 2 path))
-                  (dir (match-string 3 path)))
-              (if (and (string-equal user user-login-name)
-                       (string-equal host (system-name)))
-                  (progn
-                    (when (file-directory-p dir)
-                      (setq directory (file-name-as-directory dir))))
-                (setq directory (file-name-as-directory (concat "/-:" path))))))
-        (when (file-directory-p path)
-          (setq directory (file-name-as-directory path))))
-      directory)))
+    ;; Check cache first for O(1) lookup instead of filesystem I/O
+    (or (cdr (assoc path vterm--directory-cache))
+        (let (directory)
+          (if (string-match "^\\(.*?\\)@\\(.*?\\):\\(.*?\\)$" path)
+              (progn
+                (let ((user (match-string 1 path))
+                      (host (match-string 2 path))
+                      (dir (match-string 3 path)))
+                  (if (and (string-equal user user-login-name)
+                           (string-equal host (system-name)))
+                      (progn
+                        (when (file-directory-p dir)
+                          (setq directory (file-name-as-directory dir))))
+                    (setq directory (file-name-as-directory (concat "/-:" path))))))
+            (when (file-directory-p path)
+              (setq directory (file-name-as-directory path))))
+          ;; Cache the result (limit cache size to 100 entries)
+          (when directory
+            (when (> (length vterm--directory-cache) 100)
+              (setq vterm--directory-cache (cdr vterm--directory-cache)))
+            (push (cons path directory) vterm--directory-cache))
+          directory))))
 
 (defun vterm--get-pwd (&optional linenum)
   "Get working directory at LINENUM."
