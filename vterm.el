@@ -1823,16 +1823,21 @@ Argument EVENT process event."
 
 (defun vterm--text-scale-mode (&optional _argv)
   "Fix `line-number' height for scaled text."
-  (and text-scale-mode
-       (or (equal major-mode 'vterm-mode)
-           (derived-mode-p 'vterm-mode))
-       (boundp 'display-line-numbers)
-       (let ((height (expt text-scale-mode-step
-                           text-scale-mode-amount)))
-         (when vterm--linenum-remapping
-           (face-remap-remove-relative vterm--linenum-remapping))
-         (setq vterm--linenum-remapping
-               (face-remap-add-relative 'line-number :height height))))
+  (when (and (or (equal major-mode 'vterm-mode)
+                 (derived-mode-p 'vterm-mode))
+             (boundp 'display-line-numbers))
+    (if text-scale-mode
+        ;; text-scale-mode is enabled - apply scaling to line numbers
+        (let ((height (expt text-scale-mode-step
+                            text-scale-mode-amount)))
+          (when vterm--linenum-remapping
+            (face-remap-remove-relative vterm--linenum-remapping))
+          (setq vterm--linenum-remapping
+                (face-remap-add-relative 'line-number :height height)))
+      ;; text-scale-mode is disabled - remove line number scaling
+      (when vterm--linenum-remapping
+        (face-remap-remove-relative vterm--linenum-remapping)
+        (setq vterm--linenum-remapping nil))))
   (window--adjust-process-windows))
 
 (advice-add #'text-scale-mode :after #'vterm--text-scale-mode)
