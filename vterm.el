@@ -716,6 +716,12 @@ Benefits all platforms, with Windows gaining the most improvement.")
 (defvar-local vterm--update-count 0
   "Number of updates in current time window, used for adaptive timer.")
 
+(defvar-local vterm--last-char-height nil
+  "Last frame char height, used for DPI change detection.")
+
+(defvar-local vterm--last-char-width nil
+  "Last frame char width, used for DPI change detection.")
+
 ;;; Keybindings
 
 ;; We have many functions defined by vterm-define-key.  Later, we will bind some
@@ -1565,9 +1571,22 @@ Argument BUFFER the terminal buffer."
     (with-current-buffer buffer
       (let ((inhibit-redisplay t)
             (inhibit-read-only t)
-            (windows (get-buffer-window-list)))
+            (windows (get-buffer-window-list))
+            (char-height (frame-char-height))
+            (char-width (frame-char-width)))
         (setq vterm--redraw-timer nil)
         (when vterm--term
+          ;; Detect DPI change (char dimensions changed) - force resize
+          (when (and vterm--last-char-height
+                     vterm--last-char-width
+                     (or (not (eql char-height vterm--last-char-height))
+                         (not (eql char-width vterm--last-char-width))))
+            ;; Reset cached size to force resize recalculation
+            (setq vterm--last-width 0
+                  vterm--last-height 0)
+            (window--adjust-process-windows))
+          (setq vterm--last-char-height char-height
+                vterm--last-char-width char-width)
           (vterm--redraw vterm--term)
           (unless (zerop (window-hscroll))
             (when (cl-member (selected-window) windows :test #'eq)
