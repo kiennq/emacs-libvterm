@@ -1190,9 +1190,7 @@ will invert `vterm-copy-exclude-prompt' for that call."
     (let ((inhibit-redisplay t)
           (inhibit-read-only t))
       (vterm--update vterm--term key shift meta ctrl)
-      (setq vterm--redraw-immediately t)
-      (when accept-proc-output
-        (accept-process-output vterm--process vterm-timer-delay nil t)))))
+      (setq vterm--redraw-immediately t))))
 
 (defun vterm-send (key)
   "Send KEY to libvterm.  KEY can be anything `kbd' understands."
@@ -1388,8 +1386,7 @@ Optional argument PASTE-P paste-p."
       (vterm--update vterm--term (char-to-string char)))
     (when paste-p
       (vterm--update vterm--term "<end_paste>")))
-  (setq vterm--redraw-immediately t)
-  (accept-process-output vterm--process vterm-timer-delay nil t))
+  (setq vterm--redraw-immediately t))
 
 (defun vterm-insert (&rest contents)
   "Insert the arguments, either strings or characters, at point.
@@ -1403,8 +1400,7 @@ Provide similar behavior as `insert' for vterm."
         (dolist (char (string-to-list c))
           (vterm--update vterm--term (char-to-string char)))))
     (vterm--update vterm--term "<end_paste>")
-    (setq vterm--redraw-immediately t)
-    (accept-process-output vterm--process vterm-timer-delay nil t)))
+    (setq vterm--redraw-immediately t)))
 
 (defun vterm-delete-region (start end)
   "Delete the text between START and END for vterm."
