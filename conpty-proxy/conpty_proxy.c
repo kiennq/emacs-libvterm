@@ -20,6 +20,7 @@
 
 #define COMPLETION_KEY_IO_READ (0x01)
 #define COMPLETION_KEY_CTRL_ACCEPT (0x02)
+#define COMPLETION_KEY_CTRL_READ (0x03)
 
 enum {
     ERROR_INVALID_ARGC = 1,
@@ -69,8 +70,9 @@ typedef struct {
     char ctrl_buf[256];
 
     OVERLAPPED io_overl;
-    OVERLAPPED stdout_overl;  // For overlapped WriteFile to stdout
-    OVERLAPPED ctrl_overl;
+    OVERLAPPED stdout_overl;       // For overlapped WriteFile to stdout
+    OVERLAPPED ctrl_accept_overl;  // For ConnectNamedPipe
+    OVERLAPPED ctrl_read_overl;    // For ReadFile on control pipe
 
     arena_allocator_t* arena;  // Arena for cleanup-free resource management
 } conpty_t;
@@ -247,34 +249,40 @@ static void async_io_read(conpty_t* pty) {
 
 static void async_ctrl_accept(conpty_t* pty) {
     DisconnectNamedPipe(pty->ctrl_pipe);
-    memset(&pty->ctrl_overl, 0, sizeof(OVERLAPPED));
-    ConnectNamedPipe(pty->ctrl_pipe, &pty->ctrl_overl);
+    memset(&pty->ctrl_accept_overl, 0, sizeof(OVERLAPPED));
+    ConnectNamedPipe(pty->ctrl_pipe, &pty->ctrl_accept_overl);
+}
+
+static void async_ctrl_read(conpty_t* pty) {
+    memset(&pty->ctrl_read_overl, 0, sizeof(OVERLAPPED));
+    memset(pty->ctrl_buf, 0, sizeof(pty->ctrl_buf));
+    // Issue async read - completion will be signaled via IOCP with COMPLETION_KEY_CTRL_READ
+    ReadFile(pty->ctrl_pipe, pty->ctrl_buf, sizeof(pty->ctrl_buf), NULL, &pty->ctrl_read_overl);
 }
 
 static void on_ctrl_accept(conpty_t* pty) {
-    int width = 0;
-    int height = 0;
-    char buf[64];
-    DWORD readed;
-    ReadFile(pty->ctrl_pipe, buf, sizeof(buf), &readed, NULL);
-    if (readed <= 0) {
-        return;
+    // Client connected - issue async read operation
+    // This will not block the IOCP thread
+    async_ctrl_read(pty);
+}
+
+static void on_ctrl_read(conpty_t* pty, DWORD bytes_read) {
+    // Process resize data received from client
+    if (bytes_read > 0) {
+        int width = 0;
+        int height = 0;
+        sscanf_s(pty->ctrl_buf, "%d %d", &width, &height);
+
+        if (width > 0 && height > 0 && (pty->width != width || pty->height != height)) {
+            pty->width = width;
+            pty->height = height;
+            COORD size = {(SHORT) width, (SHORT) height};
+            g_resize_pseudo_console(pty->hpc, size);
+        }
     }
 
-    sscanf_s(buf, "%d %d", &width, &height);
-
-    if (width <= 0 || height <= 0) {
-        return;
-    }
-    if (pty->width == width && pty->height == height) {
-        return;
-    }
-
-    pty->width = width;
-    pty->height = height;
-    COORD size = {(SHORT) width, (SHORT) height};
-
-    g_resize_pseudo_console(pty->hpc, size);
+    // Re-arm accept for next client connection
+    async_ctrl_accept(pty);
 }
 
 static DWORD WINAPI iocp_entry(LPVOID param) {
@@ -300,8 +308,14 @@ static DWORD WINAPI iocp_entry(LPVOID param) {
             // Write current buffer to stdout (can block, but read continues)
             WriteFile(pty->std_out, pty->io_buf[current_buf], bytes_readed, &writted, NULL);
         } else if (comp_key == COMPLETION_KEY_CTRL_ACCEPT) {
-            on_ctrl_accept(pty);
-            async_ctrl_accept(pty);
+            // Control pipe operation completed - distinguish by OVERLAPPED pointer
+            if (ovl == &pty->ctrl_accept_overl) {
+                // ConnectNamedPipe completed - client connected
+                on_ctrl_accept(pty);
+            } else if (ovl == &pty->ctrl_read_overl) {
+                // ReadFile completed - process resize message
+                on_ctrl_read(pty, bytes_readed);
+            }
         }
     }
 
