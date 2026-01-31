@@ -1643,34 +1643,13 @@ If not found in PATH, look in the vterm.el directory."
     conpty-process))
 
 (defun vterm--conpty-proxy-resize(proc width height)
-  "Send resize command to ConPTY proxy by spawning helper process.
+  "Send resize command to ConPTY proxy via async threadpool.
 
 IMPLEMENTATION NOTE:
-Always spawns conpty-proxy.exe resize process. Direct pipe write was removed
-due to stability issues (hangs during resize).
-
-The resize is debounced by `vterm--conpty-proxy-debounce-resize` to avoid
-excessive calls during rapid window resizing."
+Uses vterm--conpty-resize-async (non-blocking threadpool write).
+No fallback needed - threadpool is always available on Windows."
   (let ((conpty-id (process-get proc 'conpty-id)))
-    ;; Spawn helper process (simple and reliable)
-    (make-process
-     :name "vterm-resize"
-     :command `(,(vterm--conpty-proxy-path) "resize"
-                ,conpty-id ,(int-to-string width) ,(int-to-string height))))
-  (cons width height))
-
-(defvar-local vterm--conpty-proxy-resize-timer nil
-  "Timer for conpty proxy resize.")
-
-(defun vterm--conpty-proxy-debounce-resize (width height)
-  "Debounce conpty proxy resize calls."
-  (when (timerp vterm--conpty-proxy-resize-timer)
-    (cancel-timer vterm--conpty-proxy-resize-timer))
-  (setq vterm--conpty-proxy-resize-timer
-        (run-with-timer
-         vterm-timer-delay nil
-         (lambda (proc w h) (vterm--conpty-proxy-resize proc w h))
-         vterm--process width height))
+    (vterm--conpty-resize-async conpty-id width height))
   (cons width height))
 
 ;;; Entry Points
@@ -1881,7 +1860,7 @@ Argument EVENT process event."
                      (> (abs (- height vterm--last-height)) 1)))
         (vterm--set-size vterm--term height width)
         (when (eq system-type 'windows-nt)
-          (vterm--conpty-proxy-debounce-resize width height))
+          (vterm--conpty-proxy-resize vterm--process width height))
         (setq vterm--last-width width
               vterm--last-height height)
         (cons width height)))))
