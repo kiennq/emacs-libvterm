@@ -1911,10 +1911,34 @@ emacs_value Fvterm_reset_cursor_point(emacs_env *env, ptrdiff_t nargs,
 }
 
 #ifdef _WIN32
-// Windows-specific function to write directly to ConPTY control pipe
-// This avoids spawning a new process on every resize
-emacs_value Fvterm_conpty_resize(emacs_env *env, ptrdiff_t nargs,
-                                 emacs_value args[], void *data) {
+// Structure to pass resize data to threadpool worker
+typedef struct {
+  char pipe_name[256];
+  char message[64];
+  int msg_len;
+} resize_work_t;
+
+// Threadpool worker that performs the blocking pipe write
+static DWORD WINAPI resize_worker(LPVOID param) {
+  resize_work_t *work = (resize_work_t *)param;
+
+  // Open named pipe for writing
+  HANDLE pipe = CreateFileA(work->pipe_name, GENERIC_WRITE, 0, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (pipe != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(pipe, work->message, work->msg_len, &written, NULL);
+    CloseHandle(pipe);
+  }
+
+  free(work);
+  return 0;
+}
+
+// Windows-specific function to write to ConPTY control pipe asynchronously
+// Uses threadpool to avoid blocking Emacs main thread
+emacs_value Fvterm_conpty_resize_async(emacs_env *env, ptrdiff_t nargs,
+                                       emacs_value args[], void *data) {
   // Args: conpty-id width height
   if (nargs < 3) {
     return Qnil;
@@ -1934,29 +1958,28 @@ emacs_value Fvterm_conpty_resize(emacs_env *env, ptrdiff_t nargs,
     return Qnil;
   }
 
-  // Construct pipe name: \\.\pipe\conpty-proxy-ctrl-{id}
-  char pipe_name[256];
-  snprintf(pipe_name, sizeof(pipe_name), "\\\\.\\pipe\\conpty-proxy-ctrl-%s",
-           conpty_id);
-  free(conpty_id);
-
-  // Open named pipe for writing
-  HANDLE pipe = CreateFileA(pipe_name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
-  if (pipe == INVALID_HANDLE_VALUE) {
-    // Pipe not available, return nil to signal fallback needed
+  // Allocate work item for threadpool
+  resize_work_t *work = (resize_work_t *)malloc(sizeof(resize_work_t));
+  if (!work) {
+    free(conpty_id);
     return Qnil;
   }
 
-  // Write resize message: "{width} {height}"
-  char msg[64];
-  int msg_len = snprintf(msg, sizeof(msg), "%d %d", width, height);
+  // Prepare work item
+  snprintf(work->pipe_name, sizeof(work->pipe_name),
+           "\\\\.\\pipe\\conpty-proxy-ctrl-%s", conpty_id);
+  work->msg_len =
+      snprintf(work->message, sizeof(work->message), "%d %d", width, height);
+  free(conpty_id);
 
-  DWORD written = 0;
-  BOOL success = WriteFile(pipe, msg, msg_len, &written, NULL);
-  CloseHandle(pipe);
+  // Queue work to threadpool - returns immediately
+  if (!QueueUserWorkItem(resize_worker, work, WT_EXECUTEDEFAULT)) {
+    free(work);
+    return Qnil;
+  }
 
-  return success ? Qt : Qnil;
+  // Return success immediately (work is queued)
+  return Qt;
 }
 #endif
 
@@ -2077,10 +2100,11 @@ int emacs_module_init(struct emacs_runtime *ert) {
   bind_function(env, "vterm--get-icrnl", fun);
 
 #ifdef _WIN32
-  fun = env->make_function(
-      env, 3, 3, Fvterm_conpty_resize,
-      "Send resize command directly to ConPTY control pipe.", NULL);
-  bind_function(env, "vterm--conpty-resize-pipe", fun);
+  fun = env->make_function(env, 3, 3, Fvterm_conpty_resize_async,
+                           "Send resize command asynchronously to ConPTY "
+                           "control pipe via threadpool.",
+                           NULL);
+  bind_function(env, "vterm--conpty-resize-async", fun);
 #endif
 
   /* Cache the Emacs major version for performance */
