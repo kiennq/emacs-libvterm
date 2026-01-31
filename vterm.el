@@ -678,6 +678,11 @@ Only background is used."
 
 (defvar-local vterm--redraw-timer nil)
 (defvar-local vterm--redraw-immediately nil)
+
+(defvar-local vterm--force-redisplay nil
+  "When non-nil, force synchronous redisplay after immediate redraw.
+This is set for truly interactive input (single keypresses) but not
+for paste operations or bulk updates to avoid excessive redisplay calls.")
 (defvar-local vterm--linenum-remapping nil)
 (defvar-local vterm--prompt-tracking-enabled-p nil)
 (defvar-local vterm--insert-function (symbol-function #'insert))
@@ -1190,7 +1195,9 @@ will invert `vterm-copy-exclude-prompt' for that call."
     (let ((inhibit-redisplay t)
           (inhibit-read-only t))
       (vterm--update vterm--term key shift meta ctrl)
-      (setq vterm--redraw-immediately t))))
+      (setq vterm--redraw-immediately t)
+      ;; Force immediate display update for interactive keyboard input
+      (setq vterm--force-redisplay t))))
 
 (defun vterm-send (key)
   "Send KEY to libvterm.  KEY can be anything `kbd' understands."
@@ -1547,8 +1554,14 @@ looks like: ((\"m\" :shift ))"
           (setq vterm--redraw-timer
                 (run-with-timer delay nil
                                 #'vterm--delayed-redraw (current-buffer)))))
+    ;; Immediate redraw for interactive input
     (vterm--delayed-redraw (current-buffer))
-    (setq vterm--redraw-immediately nil)))
+    (setq vterm--redraw-immediately nil)
+    ;; Force Emacs to update display immediately for interactive input only
+    ;; This avoids excessive redisplay calls during paste or bulk updates
+    (when vterm--force-redisplay
+      (setq vterm--force-redisplay nil)
+      (redisplay))))
 
 (defun vterm-check-proc (&optional buffer)
   "Check if there is a running process associated to the vterm buffer BUFFER.
