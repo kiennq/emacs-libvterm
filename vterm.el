@@ -716,6 +716,12 @@ Benefits all platforms, with Windows gaining the most improvement.")
 (defvar-local vterm--update-count 0
   "Number of updates in current time window, used for adaptive timer.")
 
+(defvar-local vterm--last-char-height nil
+  "Last frame char height, used for DPI change detection.")
+
+(defvar-local vterm--last-char-width nil
+  "Last frame char width, used for DPI change detection.")
+
 ;;; Keybindings
 
 ;; We have many functions defined by vterm-define-key.  Later, we will bind some
@@ -1184,9 +1190,7 @@ will invert `vterm-copy-exclude-prompt' for that call."
     (let ((inhibit-redisplay t)
           (inhibit-read-only t))
       (vterm--update vterm--term key shift meta ctrl)
-      (setq vterm--redraw-immediately t)
-      (when accept-proc-output
-        (accept-process-output vterm--process vterm-timer-delay nil t)))))
+      (setq vterm--redraw-immediately t))))
 
 (defun vterm-send (key)
   "Send KEY to libvterm.  KEY can be anything `kbd' understands."
@@ -1382,8 +1386,7 @@ Optional argument PASTE-P paste-p."
       (vterm--update vterm--term (char-to-string char)))
     (when paste-p
       (vterm--update vterm--term "<end_paste>")))
-  (setq vterm--redraw-immediately t)
-  (accept-process-output vterm--process vterm-timer-delay nil t))
+  (setq vterm--redraw-immediately t))
 
 (defun vterm-insert (&rest contents)
   "Insert the arguments, either strings or characters, at point.
@@ -1397,8 +1400,7 @@ Provide similar behavior as `insert' for vterm."
         (dolist (char (string-to-list c))
           (vterm--update vterm--term (char-to-string char)))))
     (vterm--update vterm--term "<end_paste>")
-    (setq vterm--redraw-immediately t)
-    (accept-process-output vterm--process vterm-timer-delay nil t)))
+    (setq vterm--redraw-immediately t)))
 
 (defun vterm-delete-region (start end)
   "Delete the text between START and END for vterm."
@@ -1565,9 +1567,22 @@ Argument BUFFER the terminal buffer."
     (with-current-buffer buffer
       (let ((inhibit-redisplay t)
             (inhibit-read-only t)
-            (windows (get-buffer-window-list)))
+            (windows (get-buffer-window-list))
+            (char-height (frame-char-height))
+            (char-width (frame-char-width)))
         (setq vterm--redraw-timer nil)
         (when vterm--term
+          ;; Detect DPI change (char dimensions changed) - force resize
+          (when (and vterm--last-char-height
+                     vterm--last-char-width
+                     (or (not (eql char-height vterm--last-char-height))
+                         (not (eql char-width vterm--last-char-width))))
+            ;; Reset cached size to force resize recalculation
+            (setq vterm--last-width 0
+                  vterm--last-height 0)
+            (window--adjust-process-windows))
+          (setq vterm--last-char-height char-height
+                vterm--last-char-width char-width)
           (vterm--redraw vterm--term)
           (unless (zerop (window-hscroll))
             (when (cl-member (selected-window) windows :test #'eq)
@@ -1823,16 +1838,21 @@ Argument EVENT process event."
 
 (defun vterm--text-scale-mode (&optional _argv)
   "Fix `line-number' height for scaled text."
-  (and text-scale-mode
-       (or (equal major-mode 'vterm-mode)
-           (derived-mode-p 'vterm-mode))
-       (boundp 'display-line-numbers)
-       (let ((height (expt text-scale-mode-step
-                           text-scale-mode-amount)))
-         (when vterm--linenum-remapping
-           (face-remap-remove-relative vterm--linenum-remapping))
-         (setq vterm--linenum-remapping
-               (face-remap-add-relative 'line-number :height height))))
+  (when (and (or (equal major-mode 'vterm-mode)
+                 (derived-mode-p 'vterm-mode))
+             (boundp 'display-line-numbers))
+    (if text-scale-mode
+        ;; text-scale-mode is enabled - apply scaling to line numbers
+        (let ((height (expt text-scale-mode-step
+                            text-scale-mode-amount)))
+          (when vterm--linenum-remapping
+            (face-remap-remove-relative vterm--linenum-remapping))
+          (setq vterm--linenum-remapping
+                (face-remap-add-relative 'line-number :height height)))
+      ;; text-scale-mode is disabled - remove line number scaling
+      (when vterm--linenum-remapping
+        (face-remap-remove-relative vterm--linenum-remapping)
+        (setq vterm--linenum-remapping nil))))
   (window--adjust-process-windows))
 
 (advice-add #'text-scale-mode :after #'vterm--text-scale-mode)
