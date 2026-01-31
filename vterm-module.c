@@ -1910,56 +1910,6 @@ emacs_value Fvterm_reset_cursor_point(emacs_env *env, ptrdiff_t nargs,
   return point(env);
 }
 
-#ifdef _WIN32
-// Windows-specific function to write directly to ConPTY control pipe
-// This avoids spawning a new process on every resize
-emacs_value Fvterm_conpty_resize(emacs_env *env, ptrdiff_t nargs,
-                                 emacs_value args[], void *data) {
-  // Args: conpty-id width height
-  if (nargs < 3) {
-    return Qnil;
-  }
-
-  // Extract arguments
-  ptrdiff_t id_size = 0;
-  env->copy_string_contents(env, args[0], NULL, &id_size);
-  char *conpty_id = (char *)malloc(id_size);
-  env->copy_string_contents(env, args[0], conpty_id, &id_size);
-
-  int width = env->extract_integer(env, args[1]);
-  int height = env->extract_integer(env, args[2]);
-
-  if (width <= 0 || height <= 0) {
-    free(conpty_id);
-    return Qnil;
-  }
-
-  // Construct pipe name: \\.\pipe\conpty-proxy-ctrl-{id}
-  char pipe_name[256];
-  snprintf(pipe_name, sizeof(pipe_name), "\\\\.\\pipe\\conpty-proxy-ctrl-%s",
-           conpty_id);
-  free(conpty_id);
-
-  // Open named pipe for writing
-  HANDLE pipe = CreateFileA(pipe_name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
-  if (pipe == INVALID_HANDLE_VALUE) {
-    // Pipe not available, return nil to signal fallback needed
-    return Qnil;
-  }
-
-  // Write resize message: "{width} {height}"
-  char msg[64];
-  int msg_len = snprintf(msg, sizeof(msg), "%d %d", width, height);
-
-  DWORD written = 0;
-  BOOL success = WriteFile(pipe, msg, msg_len, &written, NULL);
-  CloseHandle(pipe);
-
-  return success ? Qt : Qnil;
-}
-#endif
-
 int emacs_module_init(struct emacs_runtime *ert) {
   emacs_env *env = ert->get_environment(ert);
 
@@ -2075,13 +2025,6 @@ int emacs_module_init(struct emacs_runtime *ert) {
   fun = env->make_function(env, 1, 1, Fvterm_get_icrnl,
                            "Get the icrnl state of the pty", NULL);
   bind_function(env, "vterm--get-icrnl", fun);
-
-#ifdef _WIN32
-  fun = env->make_function(
-      env, 3, 3, Fvterm_conpty_resize,
-      "Send resize command directly to ConPTY control pipe.", NULL);
-  bind_function(env, "vterm--conpty-resize-pipe", fun);
-#endif
 
   /* Cache the Emacs major version for performance */
   cached_emacs_major_version =
