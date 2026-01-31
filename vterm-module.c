@@ -699,7 +699,7 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
     length++;                                                                  \
   } while (0)
 
-#define BATCH_CAPACITY 256
+#define BATCH_CAPACITY 512 // Increased from 256 for fewer Emacs calls
 #define PUSH_SEGMENT(seg)                                                      \
   do {                                                                         \
     if (batch_count >= BATCH_CAPACITY) {                                       \
