@@ -9,7 +9,14 @@ else()
    set(LIBVTERM_BUILD_COMMAND "make")
 endif()
 
-add_library(vterm-module MODULE vterm-module.c utf8.c elisp.c)
+# Add source files based on platform
+if(WIN32)
+  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c conpty-proxy/arena.c)
+else()
+  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c)
+endif()
+
+add_library(vterm-module MODULE ${VTERM_MODULE_SOURCES})
 set_target_properties(vterm-module PROPERTIES
   C_STANDARD 99
   C_VISIBILITY_PRESET "hidden"
@@ -138,12 +145,6 @@ endif()
 # Build conpty-proxy from local source
 if(WIN32)
   add_subdirectory(conpty-proxy)
-  add_custom_command(TARGET conpty_proxy POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-    $<TARGET_FILE:conpty_proxy>
-    ${CMAKE_CURRENT_SOURCE_DIR}/conpty_proxy.exe
-    COMMENT "Copying conpty_proxy.exe to source directory"
-  )
 endif()
 
 add_library(vterm STATIC IMPORTED)
