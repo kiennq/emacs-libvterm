@@ -135,18 +135,15 @@ else()
   file(MAKE_DIRECTORY ${LIBVTERM_INCLUDE_DIR})
 endif()
 
-# Build conpty-proxy
+# Build conpty-proxy from local source
 if(WIN32)
-  ExternalProject_add(conpty-proxy
-    GIT_REPOSITORY https://github.com/xhcoding/conpty-proxy.git
-    GIT_TAG v1.0.1
-    INSTALL_DIR ${CMAKE_CURRENT_SOURCE_DIR}
-    INSTALL_COMMAND
+  add_subdirectory(conpty-proxy)
+  add_custom_command(TARGET conpty_proxy POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
-    <BINARY_DIR>/conpty_proxy.exe
-    <INSTALL_DIR>/conpty_proxy.exe
+    $<TARGET_FILE:conpty_proxy>
+    ${CMAKE_CURRENT_SOURCE_DIR}/conpty_proxy.exe
+    COMMENT "Copying conpty_proxy.exe to source directory"
   )
-
 endif()
 
 add_library(vterm STATIC IMPORTED)
