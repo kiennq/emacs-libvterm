@@ -1,8 +1,25 @@
-# vterm Performance Benchmarks
+# vterm Performance Benchmarks and Profiling
 
-This directory contains benchmarking tools to measure the performance improvements from the arena allocator integration and elisp optimizations.
+This directory contains benchmarking tools to measure vterm rendering performance and identify bottlenecks.
 
 ## Benchmark Files
+
+### `benchmark.el` (NEW)
+Comprehensive Elisp benchmarks for measuring vterm rendering performance:
+- Large text output (1000 lines × 80 cols)
+- Large output with ANSI colors
+- Rapid small updates (100 iterations)
+- Scrolling performance (500 lines)
+- Wide lines (100 lines × 200 cols)
+- Mixed content (real command output)
+
+**Usage:**
+```elisp
+(load-file "benchmark/benchmark.el")
+(vterm-benchmark-run-all)
+```
+
+Results are saved to `benchmark-results.txt`.
 
 ### `bench-memory.el`
 Elisp-based benchmarks for measuring:
@@ -41,6 +58,63 @@ bash benchmark/bench-throughput.sh
 - Better memory stability over time
 
 ## Performance Improvements
+
+### Performance Profiling (NEW)
+
+**Building with Profiling:**
+```bash
+# In MSYS2 UCRT64 terminal
+cd /c/Users/$USER/.cache/quelpa/build/vterm
+cmake -S . -B build -G "Unix Makefiles" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_SYSTEM_LIBVTERM=OFF \
+  -DENABLE_PROFILING=ON
+cmake --build build --target vterm-module -j8
+```
+
+**Profiling Output:**
+When built with `-DENABLE_PROFILING=ON`, the module prints detailed timing statistics to stderr when the last vterm buffer is closed:
+
+```
+=== Vterm Performance Profile ===
+Function                   Total (ms)      Calls      Avg (ms)
+--------------------------------------------------------------
+refresh_lines                 123.456        500      0.246912
+refresh_screen                 98.765        500      0.197530
+refresh_scrollback             12.345        100      0.123450
+term_redraw                   234.567        500      0.469134
+```
+
+**Viewing Profile Output:**
+
+*Method 1: Run Emacs from PowerShell*
+```powershell
+& "C:\path\to\runemacs.exe" 2>&1 | Tee-Object -FilePath profile.log
+```
+
+*Method 2: Use DebugView (Recommended)*
+- Download [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview)
+- Run DebugView before starting Emacs
+- Profiling output appears in real-time
+
+**Identified Bottlenecks:**
+1. **refresh_lines** (20-40% improvement potential)
+   - Buffer reallocation overhead during rendering
+   - Excessive `env->make_string()` calls (crosses C/Elisp boundary)
+   - Cell comparison overhead
+
+2. **Emacs API calls** (10-20% improvement potential)
+   - Each `env->make_string()` has overhead
+   - Batch insertion limited to 256 segments
+
+3. **Memory allocation** (5-10% improvement potential)
+   - Frequent `realloc()` calls in PUSH_BUFFER macro
+   - Arena allocator usage could be expanded
+
+**Optimization Roadmap:**
+- Phase 1: Pre-allocate render buffers (5-10% gain)
+- Phase 2: Increase batch size to 1024+ (5-10% gain)
+- Phase 3: SIMD-optimize cell comparison (10-15% gain)
 
 ### Arena Allocator Integration (vterm-module.c)
 

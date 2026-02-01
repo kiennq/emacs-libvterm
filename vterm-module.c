@@ -14,6 +14,142 @@
 #include <unistd.h>
 #include <vterm.h>
 
+/* ============================================================================
+ * PROFILING INSTRUMENTATION
+ * Compile with -DVTERM_PROFILE to enable performance profiling
+ * ============================================================================
+ */
+#ifdef VTERM_PROFILE
+#ifdef _WIN32
+#include <windows.h>
+typedef struct {
+  LARGE_INTEGER start;
+  LARGE_INTEGER freq;
+} ProfileTimer;
+
+static inline void profile_timer_init(ProfileTimer *timer) {
+  QueryPerformanceFrequency(&timer->freq);
+}
+
+static inline void profile_timer_start(ProfileTimer *timer) {
+  QueryPerformanceCounter(&timer->start);
+}
+
+static inline double profile_timer_elapsed_ms(ProfileTimer *timer) {
+  LARGE_INTEGER end;
+  QueryPerformanceCounter(&end);
+  return (double)(end.QuadPart - timer->start.QuadPart) * 1000.0 / timer->freq.QuadPart;
+}
+#else
+#include <sys/time.h>
+typedef struct {
+  struct timeval start;
+} ProfileTimer;
+
+static inline void profile_timer_init(ProfileTimer *timer) {
+  (void)timer;
+}
+
+static inline void profile_timer_start(ProfileTimer *timer) {
+  gettimeofday(&timer->start, NULL);
+}
+
+static inline double profile_timer_elapsed_ms(ProfileTimer *timer) {
+  struct timeval end;
+  gettimeofday(&end, NULL);
+  return (end.tv_sec - timer->start.tv_sec) * 1000.0 +
+         (end.tv_usec - timer->start.tv_usec) / 1000.0;
+}
+#endif
+
+typedef struct {
+  const char *name;
+  double total_ms;
+  uint64_t call_count;
+} ProfileStats;
+
+static ProfileStats profile_stats[] = {
+  {"refresh_lines", 0.0, 0},
+  {"refresh_screen", 0.0, 0},
+  {"refresh_scrollback", 0.0, 0},
+  {"term_redraw", 0.0, 0},
+  {"render_text", 0.0, 0},
+  {"fast_compare_cells", 0.0, 0},
+  {"insert_batch", 0.0, 0},
+  {"fetch_cell", 0.0, 0},
+  {"codepoint_to_utf8", 0.0, 0},
+  {"adjust_topline", 0.0, 0},
+  {"term_redraw_cursor", 0.0, 0},
+};
+
+#define PROFILE_REFRESH_LINES 0
+#define PROFILE_REFRESH_SCREEN 1
+#define PROFILE_REFRESH_SCROLLBACK 2
+#define PROFILE_TERM_REDRAW 3
+#define PROFILE_RENDER_TEXT 4
+#define PROFILE_FAST_COMPARE_CELLS 5
+#define PROFILE_INSERT_BATCH 6
+#define PROFILE_FETCH_CELL 7
+#define PROFILE_CODEPOINT_TO_UTF8 8
+#define PROFILE_ADJUST_TOPLINE 9
+#define PROFILE_TERM_REDRAW_CURSOR 10
+
+static ProfileTimer _prof_timers[11];  /* One timer per function */
+static int _profile_initialized = 0;
+
+#define PROFILE_START(idx) \
+  do { \
+    if (!_profile_initialized) { \
+      for (int _i = 0; _i < 11; _i++) { \
+        profile_timer_init(&_prof_timers[_i]); \
+      } \
+      _profile_initialized = 1; \
+    } \
+    profile_timer_start(&_prof_timers[idx]); \
+  } while(0)
+
+#define PROFILE_END(idx) \
+  do { \
+    double _elapsed = profile_timer_elapsed_ms(&_prof_timers[idx]); \
+    profile_stats[idx].total_ms += _elapsed; \
+    profile_stats[idx].call_count++; \
+  } while(0)
+
+static void profile_print_stats(void) {
+  // Write to file for reliability
+  FILE *logfile = fopen("C:\\Users\\kienn\\.cache\\vterm\\vterm-profile.txt", "w");
+  FILE *outputs[2] = {stderr, logfile};
+  
+  for (int out_idx = 0; out_idx < 2; out_idx++) {
+    FILE *out = outputs[out_idx];
+    if (!out) continue;
+    
+    fprintf(out, "\n=== Vterm Performance Profile ===\n");
+    fprintf(out, "%-25s %12s %10s %12s\n", "Function", "Total (ms)", "Calls", "Avg (ms)");
+    fprintf(out, "--------------------------------------------------------------\n");
+    for (size_t i = 0; i < sizeof(profile_stats) / sizeof(profile_stats[0]); i++) {
+      if (profile_stats[i].call_count > 0) {
+        double avg = profile_stats[i].total_ms / profile_stats[i].call_count;
+        fprintf(out, "%-25s %12.3f %10llu %12.6f\n",
+                profile_stats[i].name,
+                profile_stats[i].total_ms,
+                (unsigned long long)profile_stats[i].call_count,
+                avg);
+      }
+    }
+    fprintf(out, "--------------------------------------------------------------\n");
+    fflush(out);
+  }
+  
+  if (logfile) fclose(logfile);
+}
+
+#else
+#define PROFILE_START(idx) do {} while(0)
+#define PROFILE_END(idx) do {} while(0)
+static inline void profile_print_stats(void) {}
+#endif
+
 /* Cached Emacs major version to avoid repeated symbol lookups */
 static int cached_emacs_major_version = 0;
 
@@ -275,21 +411,29 @@ VTERM_INLINE ScrollbackLine *sb_pop_newest(Term *term) {
  */
 
 VTERM_INLINE bool fast_compare_cells(VTermScreenCell *a, VTermScreenCell *b) {
+  PROFILE_START(PROFILE_FAST_COMPARE_CELLS);
+  
   /* First compare attributes as a single check - most cells have same attrs */
   if (a->attrs.bold != b->attrs.bold ||
       a->attrs.underline != b->attrs.underline ||
       a->attrs.italic != b->attrs.italic ||
       a->attrs.reverse != b->attrs.reverse ||
       a->attrs.strike != b->attrs.strike) {
+    PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
     return false;
   }
 
   /* Compare colors - use type-specific comparison */
-  if (!vterm_color_is_equal(&a->fg, &b->fg))
+  if (!vterm_color_is_equal(&a->fg, &b->fg)) {
+    PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
     return false;
-  if (!vterm_color_is_equal(&a->bg, &b->bg))
+  }
+  if (!vterm_color_is_equal(&a->bg, &b->bg)) {
+    PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
     return false;
+  }
 
+  PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
   return true;
 }
 
@@ -576,6 +720,8 @@ VTERM_INLINE ScrollbackLine *get_scrollback_line(Term *term,
 }
 
 static void fetch_cell(Term *term, int row, int col, VTermScreenCell *cell) {
+  PROFILE_START(PROFILE_FETCH_CELL);
+  
   if (row < 0) {
     ScrollbackLine *sbrow = get_scrollback_line(term, (size_t)(-row - 1));
     if (sbrow != NULL && (size_t)col < sbrow->cols) {
@@ -591,6 +737,8 @@ static void fetch_cell(Term *term, int row, int col, VTermScreenCell *cell) {
   } else {
     vterm_screen_get_cell(term->vts, (VTermPos){.row = row, .col = col}, cell);
   }
+  
+  PROFILE_END(PROFILE_FETCH_CELL);
 }
 
 static char *get_row_directory(Term *term, int row) {
@@ -684,11 +832,15 @@ static void goto_col(Term *term, emacs_env *env, int row, int end_col) {
 
 static void refresh_lines(Term *term, emacs_env *env, int start_row,
                           int end_row, int end_col) {
+  PROFILE_START(PROFILE_REFRESH_LINES);
+  
   if (end_row < start_row) {
+    PROFILE_END(PROFILE_REFRESH_LINES);
     return;
   }
   int i, j;
 
+/* BASELINE: Original code with realloc for comparison */
 #define PUSH_BUFFER(c)                                                         \
   do {                                                                         \
     if (length == capacity) {                                                  \
@@ -699,11 +851,13 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
     length++;                                                                  \
   } while (0)
 
-#define BATCH_CAPACITY 512 // Increased from 256 for fewer Emacs calls
+#define BATCH_CAPACITY 2048  /* Phase 2: Increased from 256/512 to reduce insert_batch calls */
 #define PUSH_SEGMENT(seg)                                                      \
   do {                                                                         \
     if (batch_count >= BATCH_CAPACITY) {                                       \
+      PROFILE_START(PROFILE_INSERT_BATCH);                                     \
       insert_batch(env, batch, batch_count);                                   \
+      PROFILE_END(PROFILE_INSERT_BATCH);                                       \
       batch_count = 0;                                                         \
     }                                                                          \
     batch[batch_count++] = (seg);                                              \
@@ -797,7 +951,9 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
 
   /* Flush remaining batch */
   if (batch_count > 0) {
+    PROFILE_START(PROFILE_INSERT_BATCH);
     insert_batch(env, batch, batch_count);
+    PROFILE_END(PROFILE_INSERT_BATCH);
   }
 
 #undef PUSH_BUFFER
@@ -808,11 +964,13 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
   free(buffer);
 #endif
 
+  PROFILE_END(PROFILE_REFRESH_LINES);
   return;
 }
 // Refresh the screen (visible part of the buffer when the terminal is
 // focused) of a invalidated terminal
 static void refresh_screen(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_REFRESH_SCREEN);
   // Term height may have decreased before `invalid_end` reflects it.
   term->invalid_end = MIN(term->invalid_end, term->height);
 
@@ -833,6 +991,7 @@ static void refresh_screen(Term *term, emacs_env *env) {
 
   term->invalid_start = INT_MAX;
   term->invalid_end = -1;
+  PROFILE_END(PROFILE_REFRESH_SCREEN);
 }
 
 static int term_resize(int rows, int cols, void *user_data) {
@@ -893,6 +1052,7 @@ static int term_resize(int rows, int cols, void *user_data) {
 
 // Refresh the scrollback of an invalidated terminal.
 static void refresh_scrollback(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_REFRESH_SCROLLBACK);
   int max_line_count = (int)term->sb_current + term->height;
   int del_cnt = 0;
   if (term->sb_clear_pending) {
@@ -941,12 +1101,33 @@ static void refresh_scrollback(Term *term, emacs_env *env) {
 
   term->sb_pending_by_height_decr = 0;
   term->height_resize = 0;
+  PROFILE_END(PROFILE_REFRESH_SCROLLBACK);
 }
 
+/* Cache for adjust_topline optimization - cursor position + viewport info */
+static struct {
+  int cursor_row;
+  int cursor_col;
+  int term_height;
+  int last_win_body_height;
+  bool valid;
+} adjust_topline_cache = {-1, -1, -1, -1, false};
+
 static void adjust_topline(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_ADJUST_TOPLINE);
+  
   VTermState *state = vterm_obtain_state(term->vt);
   VTermPos pos;
   vterm_state_get_cursorpos(state, &pos);
+
+  /* OPTIMIZATION 1: Skip if cursor position and terminal height unchanged */
+  if (adjust_topline_cache.valid &&
+      pos.row == adjust_topline_cache.cursor_row &&
+      pos.col == adjust_topline_cache.cursor_col &&
+      term->height == adjust_topline_cache.term_height) {
+    PROFILE_END(PROFILE_ADJUST_TOPLINE);
+    return;
+  }
 
   /* pos.row-term->height is negative, so we backward term->height-pos.row
    * lines from end of buffer
@@ -955,28 +1136,62 @@ static void adjust_topline(Term *term, emacs_env *env) {
   goto_line(env, pos.row - term->height);
   goto_col(term, env, pos.row, pos.col);
 
-  emacs_value windows = get_buffer_window_list(env);
+  /* OPTIMIZATION 2: Get selected window and check if we need expensive operations */
   emacs_value swindow = selected_window(env);
-  int winnum = env->extract_integer(env, length(env, windows));
-  for (int i = 0; i < winnum; i++) {
-    emacs_value window = nth(env, i, windows);
-    if (eq(env, window, swindow)) {
-      int win_body_height =
-          env->extract_integer(env, window_body_height(env, window));
+  int win_body_height =
+      env->extract_integer(env, window_body_height(env, swindow));
 
-      /* recenter:If ARG is negative, it counts up from the bottom of the
-       * window.  (ARG should be less than the height of the window ) */
-      if (term->height - pos.row <= win_body_height) {
-        recenter(env, env->make_integer(env, pos.row - term->height));
-      } else {
-        recenter(env, env->make_integer(env, pos.row));
-      }
-    } else {
-      if (env->is_not_nil(env, window)) {
-        set_window_point(env, window, point(env));
-      }
+  /* Cache viewport info for next comparison */
+  int old_cursor_row = adjust_topline_cache.cursor_row;
+  adjust_topline_cache.cursor_row = pos.row;
+  adjust_topline_cache.cursor_col = pos.col;
+  adjust_topline_cache.term_height = term->height;
+  adjust_topline_cache.last_win_body_height = win_body_height;
+  adjust_topline_cache.valid = true;
+
+  /* OPTIMIZATION 3: Smart viewport check - skip recenter if cursor safely within view
+   * Calculate cursor position within the visible viewport:
+   * - Bottom of terminal is at line (term->height)
+   * - Cursor is at pos.row from bottom
+   * - Visible viewport shows win_body_height lines
+   */
+  int cursor_from_bottom = term->height - pos.row;
+  int margin = 3;  /* Safety margin from viewport edges */
+
+  /* Check if cursor is safely within viewport (not near edges) */
+  bool cursor_in_safe_zone = (cursor_from_bottom > margin) && 
+                             (cursor_from_bottom < win_body_height - margin);
+  
+  /* If cursor moved by only a small amount and is in safe zone, skip recentering */
+  if (cursor_in_safe_zone && old_cursor_row >= 0) {
+    int cursor_delta = abs(pos.row - old_cursor_row);
+    if (cursor_delta <= 2) {
+      /* Minor cursor movement within safe zone - no recenter needed */
+      PROFILE_END(PROFILE_ADJUST_TOPLINE);
+      return;
     }
   }
+
+  /* OPTIMIZATION 4: Only recenter selected window, skip multi-window sync
+   * Original code iterated all windows and synced points. This is expensive.
+   * Most users only care about selected window. If needed, other windows
+   * will sync when they become selected.
+   */
+
+  /* recenter: If ARG is negative, it counts up from the bottom of the
+   * window. (ARG should be less than the height of the window) */
+  if (term->height - pos.row <= win_body_height) {
+    recenter(env, env->make_integer(env, pos.row - term->height));
+  } else {
+    recenter(env, env->make_integer(env, pos.row));
+  }
+  
+  PROFILE_END(PROFILE_ADJUST_TOPLINE);
+}
+
+/* Invalidate adjust_topline cache (call when window configuration changes) */
+static void invalidate_adjust_topline_cache(void) {
+  adjust_topline_cache.valid = false;
 }
 
 static void invalidate_terminal(Term *term, int start_row, int end_row) {
@@ -1017,6 +1232,8 @@ static int term_movecursor(VTermPos new, VTermPos old, int visible,
 }
 
 static void term_redraw_cursor(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_TERM_REDRAW_CURSOR);
+  
   if (term->cursor.cursor_blink_changed) {
     term->cursor.cursor_blink_changed = false;
     set_cursor_blink(env, term->cursor.cursor_blink);
@@ -1027,6 +1244,7 @@ static void term_redraw_cursor(Term *term, emacs_env *env) {
 
     if (!term->cursor.cursor_visible) {
       set_cursor_type(env, Qnil);
+      PROFILE_END(PROFILE_TERM_REDRAW_CURSOR);
       return;
     }
 
@@ -1045,9 +1263,12 @@ static void term_redraw_cursor(Term *term, emacs_env *env) {
       break;
     }
   }
+  
+  PROFILE_END(PROFILE_TERM_REDRAW_CURSOR);
 }
 
 static void term_redraw(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_TERM_REDRAW);
   term_redraw_cursor(term, env);
 
   if (term->is_invalidated) {
@@ -1104,6 +1325,8 @@ static void term_redraw(Term *term, emacs_env *env) {
     arena_reset(term->temp_arena);
   }
 #endif
+
+  PROFILE_END(PROFILE_TERM_REDRAW);
 }
 
 static VTermScreenCallbacks vterm_screen_callbacks = {
@@ -1215,9 +1438,11 @@ static int term_settermprop(VTermProp prop, VTermValue *val, void *user_data) {
 
 static emacs_value render_text(emacs_env *env, Term *term, char *buffer,
                                int len, VTermScreenCell *cell) {
+  PROFILE_START(PROFILE_RENDER_TEXT);
   emacs_value text;
   if (len == 0) {
     text = env->make_string(env, "", 0);
+    PROFILE_END(PROFILE_RENDER_TEXT);
     return text;
   } else {
     text = env->make_string(env, buffer, len);
@@ -1269,6 +1494,7 @@ static emacs_value render_text(emacs_env *env, Term *term, char *buffer,
   if (props_len)
     put_text_property(env, text, Qface, properties);
 
+  PROFILE_END(PROFILE_RENDER_TEXT);
   return text;
 }
 static emacs_value render_prompt(emacs_env *env, emacs_value text) {
@@ -1477,6 +1703,17 @@ void term_finalize(void *object) {
   if (term->temp_arena != NULL) {
     arena_destroy(term->temp_arena);
   }
+#endif
+
+#ifdef VTERM_PROFILE
+  /* Print profiling stats when term is finalized */
+  /* Write debug marker to see if finalize is called */
+  FILE *debug = fopen("C:\\Users\\kienn\\.cache\\vterm\\finalize-debug.txt", "a");
+  if (debug) {
+    fprintf(debug, "term_finalize called\n");
+    fclose(debug);
+  }
+  profile_print_stats();
 #endif
 
   free(term);
@@ -1983,6 +2220,18 @@ emacs_value Fvterm_conpty_resize_async(emacs_env *env, ptrdiff_t nargs,
 }
 #endif
 
+#ifdef VTERM_PROFILE
+/* Elisp-callable function to print profiling stats */
+static emacs_value Fvterm_print_profile(emacs_env *env, ptrdiff_t nargs,
+                                        emacs_value args[], void *data) {
+  (void)nargs;
+  (void)args;
+  (void)data;
+  profile_print_stats();
+  return Qt;
+}
+#endif
+
 int emacs_module_init(struct emacs_runtime *ert) {
   emacs_env *env = ert->get_environment(ert);
 
@@ -2105,6 +2354,13 @@ int emacs_module_init(struct emacs_runtime *ert) {
                            "control pipe via threadpool.",
                            NULL);
   bind_function(env, "vterm--conpty-resize-async", fun);
+#endif
+
+#ifdef VTERM_PROFILE
+  fun = env->make_function(env, 0, 0, Fvterm_print_profile,
+                           "Print vterm profiling statistics.",
+                           NULL);
+  bind_function(env, "vterm--print-profile", fun);
 #endif
 
   /* Cache the Emacs major version for performance */

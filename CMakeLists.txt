@@ -25,6 +25,13 @@ set_target_properties(vterm-module PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}
   )
 
+# Profiling option
+option(ENABLE_PROFILING "Enable performance profiling instrumentation" OFF)
+if(ENABLE_PROFILING)
+  target_compile_definitions(vterm-module PRIVATE VTERM_PROFILE)
+  message(STATUS "Performance profiling enabled")
+endif()
+
 # Set RelWithDebInfo as default build type
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "No build type selected, defaulting to RelWithDebInfo")
