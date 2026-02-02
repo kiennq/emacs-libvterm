@@ -144,43 +144,74 @@ the executable."
 
 ;;;###autoload
 (defun vterm-ensure-binary (&optional forced)
-  "Ensure the vterm module binarines.
+  "Ensure the vterm module binaries.
 Will redownload if FORCED.
-Currently only applicable for Windows."
+Supports Windows and Linux platforms with x86_64 and aarch64 architectures."
   (interactive "P")
   (when-let* ((default-directory (or vterm-binaries-dir (file-name-directory (find-library-name "vterm.el"))))
-              (_ (and (eq system-type 'windows-nt)
+              (_ (and (memq system-type '(windows-nt gnu/linux))
                       (or forced
                           (not (file-exists-p (expand-file-name
                                                (format "vterm-module%s" module-file-suffix))))))))
-    (let* ((bin-file "vterm-x86_64-windows.zip")
+    (let* ((arch (car (split-string system-configuration "-")))
+           (arch-name (pcase arch
+                        ((or "x86_64" "amd64") "x86_64")
+                        ((or "aarch64" "arm64") "aarch64")
+                        (_ arch)))
+           (os-name (pcase system-type
+                      ('windows-nt "windows")
+                      ('gnu/linux "linux")
+                      (_ (symbol-name system-type))))
+           (bin-file (format "vterm-module-%s-%s.zip" arch-name os-name))
            (url (format vterm-binaries-download-url bin-file))
            (exec-path (append exec-path `(,(expand-file-name
                                             (concat exec-directory "../../../../bin"))))))
       (unless (file-directory-p default-directory)
         (make-directory default-directory 'parents))
-      ;; move all *.exe and *.dll files to *.old on Windows
-      (dolist (f (directory-files default-directory t "\\.\\(exe\\|dll\\)\\'"))
-        (ignore-errors
-          (rename-file f (concat f ".old") 'ok-if-already-exists)))
+      ;; Backup existing binaries
+      (let ((ext-pattern (pcase system-type
+                           ('windows-nt "\\.\\(exe\\|dll\\)\\'")
+                           ('gnu/linux "\\.so\\'"))))
+        (dolist (f (directory-files default-directory t ext-pattern))
+          (ignore-errors
+            (rename-file f (concat f ".old") 'ok-if-already-exists))))
+      (message "Downloading vterm binary from %s..." url)
       (url-copy-file url bin-file 'ok-if-already-exists)
-      (call-process "tar" nil nil nil "xf" bin-file))))
+      (call-process "tar" nil nil nil "xf" bin-file)
+      (delete-file bin-file)
+      (message "vterm binary installed successfully."))))
 
-;; If the vterm-module is not compiled yet, compile it
+;; If the vterm-module is not compiled yet, try to download or compile it
 (unless (require 'vterm-module
                  (when vterm-binaries-dir
                    (expand-file-name (format "vterm-module%s" module-file-suffix)
                                      vterm-binaries-dir))
                  t)
   (cond
-   ((eq system-type 'windows-nt)
-    (vterm-ensure-binary)
-    (require 'vterm-module
-             (when vterm-binaries-dir
-               (expand-file-name (format "vterm-module%s" module-file-suffix)
-                                 vterm-binaries-dir))))
+   ;; Windows and Linux: try downloading prebuilt binaries first
+   ((memq system-type '(windows-nt gnu/linux))
+    (condition-case err
+        (progn
+          (vterm-ensure-binary)
+          (require 'vterm-module
+                   (when vterm-binaries-dir
+                     (expand-file-name (format "vterm-module%s" module-file-suffix)
+                                       vterm-binaries-dir))))
+      (error
+       ;; If download fails on Linux, fall back to compilation
+       (if (eq system-type 'gnu/linux)
+           (if (or vterm-always-compile-module
+                   (y-or-n-p (format "Download failed (%s). Compile vterm-module instead? "
+                                     (error-message-string err))))
+               (progn
+                 (vterm-module-compile)
+                 (require 'vterm-module))
+             (error "Vterm will not work until `vterm-module' is compiled!"))
+         ;; On Windows, re-raise the error
+         (signal (car err) (cdr err))))))
+   ;; Other platforms: compile from source
    ((or vterm-always-compile-module
-          (y-or-n-p "Vterm needs `vterm-module' to work.  Compile it now? "))
+        (y-or-n-p "Vterm needs `vterm-module' to work.  Compile it now? "))
     (vterm-module-compile)
     (require 'vterm-module))
    (t
@@ -252,7 +283,7 @@ named \"*vterm*<2>\"."
   :type 'string
   :group 'vterm)
 
-(defcustom vterm-max-scrollback 1000
+(defcustom vterm-max-scrollback 10000
   "Maximum \\='scrollback\\=' value.
 
 The maximum allowed is 100000.  This value can modified by
@@ -647,6 +678,11 @@ Only background is used."
 
 (defvar-local vterm--redraw-timer nil)
 (defvar-local vterm--redraw-immediately nil)
+
+(defvar-local vterm--force-redisplay nil
+  "When non-nil, force synchronous redisplay after immediate redraw.
+This is set for truly interactive input (single keypresses) but not
+for paste operations or bulk updates to avoid excessive redisplay calls.")
 (defvar-local vterm--linenum-remapping nil)
 (defvar-local vterm--prompt-tracking-enabled-p nil)
 (defvar-local vterm--insert-function (symbol-function #'insert))
@@ -654,14 +690,42 @@ Only background is used."
 (defvar-local vterm--delete-region-function (symbol-function #'delete-region))
 (defvar-local vterm--undecoded-bytes nil)
 (defvar-local vterm--copy-mode-fake-newlines nil)
+(defvar-local vterm--directory-cache nil
+  "Cache for directory existence checks to improve performance.
+Especially beneficial on Windows where filesystem operations are slower.")
+(defvar-local vterm--conpty-ctrl-process nil
+  "Persistent control process for sending resize commands to ConPTY on Windows.
+This avoids spawning a new process on every resize.")
 
 (define-obsolete-variable-alias 'vterm--redraw-immididately 'vterm--redraw-immediately "2025-07-15")
 
 (defvar vterm-timer-delay 0.1
   "Delay for refreshing the buffer after receiving updates from libvterm.
 
-A larger delary improves performance when receiving large bursts
+A larger delay improves performance when receiving large bursts
 of data.  If nil, never delay.  The units are seconds.")
+
+(defvar vterm-timer-delay-bulk 0.3
+  "Delay for refreshing during high-volume output (e.g., cat large file).
+This longer delay allows better batching of updates, reducing CPU overhead.
+Used when vterm-adaptive-timer is non-nil.")
+
+(defvar vterm-adaptive-timer t
+  "Use adaptive timer delays based on output volume.
+When non-nil, uses longer delays during bulk output to improve performance.
+Benefits all platforms, with Windows gaining the most improvement.")
+
+(defvar-local vterm--last-update-time nil
+  "Timestamp of last vterm update, used for adaptive timer.")
+
+(defvar-local vterm--update-count 0
+  "Number of updates in current time window, used for adaptive timer.")
+
+(defvar-local vterm--last-char-height nil
+  "Last frame char height, used for DPI change detection.")
+
+(defvar-local vterm--last-char-width nil
+  "Last frame char width, used for DPI change detection.")
 
 ;;; Keybindings
 
@@ -1132,8 +1196,8 @@ will invert `vterm-copy-exclude-prompt' for that call."
           (inhibit-read-only t))
       (vterm--update vterm--term key shift meta ctrl)
       (setq vterm--redraw-immediately t)
-      (when accept-proc-output
-        (accept-process-output vterm--process vterm-timer-delay nil t)))))
+      ;; Force immediate display update for interactive keyboard input
+      (setq vterm--force-redisplay t))))
 
 (defun vterm-send (key)
   "Send KEY to libvterm.  KEY can be anything `kbd' understands."
@@ -1329,8 +1393,7 @@ Optional argument PASTE-P paste-p."
       (vterm--update vterm--term (char-to-string char)))
     (when paste-p
       (vterm--update vterm--term "<end_paste>")))
-  (setq vterm--redraw-immediately t)
-  (accept-process-output vterm--process vterm-timer-delay nil t))
+  (setq vterm--redraw-immediately t))
 
 (defun vterm-insert (&rest contents)
   "Insert the arguments, either strings or characters, at point.
@@ -1344,8 +1407,7 @@ Provide similar behavior as `insert' for vterm."
         (dolist (char (string-to-list c))
           (vterm--update vterm--term (char-to-string char)))))
     (vterm--update vterm--term "<end_paste>")
-    (setq vterm--redraw-immediately t)
-    (accept-process-output vterm--process vterm-timer-delay nil t)))
+    (setq vterm--redraw-immediately t)))
 
 (defun vterm-delete-region (start end)
   "Delete the text between START and END for vterm."
@@ -1474,11 +1536,32 @@ looks like: ((\"m\" :shift ))"
   (if (and (not vterm--redraw-immediately)
            vterm-timer-delay)
       (unless vterm--redraw-timer
-        (setq vterm--redraw-timer
-              (run-with-timer vterm-timer-delay nil
-                              #'vterm--delayed-redraw (current-buffer))))
+        ;; Adaptive timer: use longer delay for bulk output
+        (let* ((now (float-time))
+               (delay (if (and vterm-adaptive-timer
+                               vterm--last-update-time
+                               (< (- now vterm--last-update-time) 1.0))
+                          ;; High frequency updates - use bulk delay
+                          (progn
+                            (setq vterm--update-count (1+ vterm--update-count))
+                            (if (> vterm--update-count 5)
+                                vterm-timer-delay-bulk
+                              vterm-timer-delay))
+                        ;; Low frequency - use normal delay and reset counter
+                        (setq vterm--update-count 0)
+                        vterm-timer-delay)))
+          (setq vterm--last-update-time now)
+          (setq vterm--redraw-timer
+                (run-with-timer delay nil
+                                #'vterm--delayed-redraw (current-buffer)))))
+    ;; Immediate redraw for interactive input
     (vterm--delayed-redraw (current-buffer))
-    (setq vterm--redraw-immediately nil)))
+    (setq vterm--redraw-immediately nil)
+    ;; Force Emacs to update display immediately for interactive input only
+    ;; This avoids excessive redisplay calls during paste or bulk updates
+    (when vterm--force-redisplay
+      (setq vterm--force-redisplay nil)
+      (redisplay))))
 
 (defun vterm-check-proc (&optional buffer)
   "Check if there is a running process associated to the vterm buffer BUFFER.
@@ -1497,9 +1580,22 @@ Argument BUFFER the terminal buffer."
     (with-current-buffer buffer
       (let ((inhibit-redisplay t)
             (inhibit-read-only t)
-            (windows (get-buffer-window-list)))
+            (windows (get-buffer-window-list))
+            (char-height (frame-char-height))
+            (char-width (frame-char-width)))
         (setq vterm--redraw-timer nil)
         (when vterm--term
+          ;; Detect DPI change (char dimensions changed) - force resize
+          (when (and vterm--last-char-height
+                     vterm--last-char-width
+                     (or (not (eql char-height vterm--last-char-height))
+                         (not (eql char-width vterm--last-char-width))))
+            ;; Reset cached size to force resize recalculation
+            (setq vterm--last-width 0
+                  vterm--last-height 0)
+            (window--adjust-process-windows))
+          (setq vterm--last-char-height char-height
+                vterm--last-char-width char-width)
           (vterm--redraw vterm--term)
           (unless (zerop (window-hscroll))
             (when (cl-member (selected-window) windows :test #'eq)
@@ -1560,27 +1656,13 @@ If not found in PATH, look in the vterm.el directory."
     conpty-process))
 
 (defun vterm--conpty-proxy-resize(proc width height)
-  "Call conpty proxy resize command."
-  ;; debounce creating new process by using timer
+  "Send resize command to ConPTY proxy via async threadpool.
+
+IMPLEMENTATION NOTE:
+Uses vterm--conpty-resize-async (non-blocking threadpool write).
+No fallback needed - threadpool is always available on Windows."
   (let ((conpty-id (process-get proc 'conpty-id)))
-    (make-process
-     :name "vterm-resize"
-     :command `(,(vterm--conpty-proxy-path) "resize"
-                ,conpty-id ,(int-to-string width) ,(int-to-string height))))
-  (cons width height))
-
-(defvar-local vterm--conpty-proxy-resize-timer nil
-  "Timer for conpty proxy resize.")
-
-(defun vterm--conpty-proxy-debounce-resize (width height)
-  "Debounce conpty proxy resize calls."
-  (when (timerp vterm--conpty-proxy-resize-timer)
-    (cancel-timer vterm--conpty-proxy-resize-timer))
-  (setq vterm--conpty-proxy-resize-timer
-        (run-with-timer
-         vterm-timer-delay nil
-         (lambda (proc w h) (vterm--conpty-proxy-resize proc w h))
-         vterm--process width height))
+    (vterm--conpty-resize-async conpty-id width height))
   (cons width height))
 
 ;;; Entry Points
@@ -1744,16 +1826,21 @@ Argument EVENT process event."
 
 (defun vterm--text-scale-mode (&optional _argv)
   "Fix `line-number' height for scaled text."
-  (and text-scale-mode
-       (or (equal major-mode 'vterm-mode)
-           (derived-mode-p 'vterm-mode))
-       (boundp 'display-line-numbers)
-       (let ((height (expt text-scale-mode-step
-                           text-scale-mode-amount)))
-         (when vterm--linenum-remapping
-           (face-remap-remove-relative vterm--linenum-remapping))
-         (setq vterm--linenum-remapping
-               (face-remap-add-relative 'line-number :height height))))
+  (when (and (or (equal major-mode 'vterm-mode)
+                 (derived-mode-p 'vterm-mode))
+             (boundp 'display-line-numbers))
+    (if text-scale-mode
+        ;; text-scale-mode is enabled - apply scaling to line numbers
+        (let ((height (expt text-scale-mode-step
+                            text-scale-mode-amount)))
+          (when vterm--linenum-remapping
+            (face-remap-remove-relative vterm--linenum-remapping))
+          (setq vterm--linenum-remapping
+                (face-remap-add-relative 'line-number :height height)))
+      ;; text-scale-mode is disabled - remove line number scaling
+      (when vterm--linenum-remapping
+        (face-remap-remove-relative vterm--linenum-remapping)
+        (setq vterm--linenum-remapping nil))))
   (window--adjust-process-windows))
 
 (advice-add #'text-scale-mode :after #'vterm--text-scale-mode)
@@ -1786,7 +1873,7 @@ Argument EVENT process event."
                      (> (abs (- height vterm--last-height)) 1)))
         (vterm--set-size vterm--term height width)
         (when (eq system-type 'windows-nt)
-          (vterm--conpty-proxy-debounce-resize width height))
+          (vterm--conpty-proxy-resize vterm--process width height))
         (setq vterm--last-width width
               vterm--last-height height)
         (cons width height)))))
@@ -1834,23 +1921,31 @@ If N is negative backward-line from end of buffer."
     (when dir (setq default-directory dir))))
 
 (defun vterm--get-directory (path)
-  "Get normalized directory to PATH."
+  "Get normalized directory to PATH.
+Uses a cache to avoid repeated filesystem checks on all platforms."
   (when path
-    (let (directory)
-      (if (string-match "^\\(.*?\\)@\\(.*?\\):\\(.*?\\)$" path)
-          (progn
-            (let ((user (match-string 1 path))
-                  (host (match-string 2 path))
-                  (dir (match-string 3 path)))
-              (if (and (string-equal user user-login-name)
-                       (string-equal host (system-name)))
-                  (progn
-                    (when (file-directory-p dir)
-                      (setq directory (file-name-as-directory dir))))
-                (setq directory (file-name-as-directory (concat "/-:" path))))))
-        (when (file-directory-p path)
-          (setq directory (file-name-as-directory path))))
-      directory)))
+    ;; Check cache first for O(1) lookup instead of filesystem I/O
+    (or (cdr (assoc path vterm--directory-cache))
+        (let (directory)
+          (if (string-match "^\\(.*?\\)@\\(.*?\\):\\(.*?\\)$" path)
+              (progn
+                (let ((user (match-string 1 path))
+                      (host (match-string 2 path))
+                      (dir (match-string 3 path)))
+                  (if (and (string-equal user user-login-name)
+                           (string-equal host (system-name)))
+                      (progn
+                        (when (file-directory-p dir)
+                          (setq directory (file-name-as-directory dir))))
+                    (setq directory (file-name-as-directory (concat "/-:" path))))))
+            (when (file-directory-p path)
+              (setq directory (file-name-as-directory path))))
+          ;; Cache the result (limit cache size to 100 entries)
+          (when directory
+            (when (> (length vterm--directory-cache) 100)
+              (setq vterm--directory-cache (cdr vterm--directory-cache)))
+            (push (cons path directory) vterm--directory-cache))
+          directory))))
 
 (defun vterm--get-pwd (&optional linenum)
   "Get working directory at LINENUM."
