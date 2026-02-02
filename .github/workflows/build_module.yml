@@ -6,31 +6,21 @@ on:
     paths:
     - '*.c'
     - '*.h'
+    - 'CMakeLists.txt'
     - '.github/workflows/build_module.yml'
-
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
+  # First job: determine version and create release tag
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
-        id: msys2
-        with:
-          msystem: ucrt64
-          install: >-
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-libvterm
-            mingw-w64-ucrt-x86_64-libtool
-            mingw-w64-ucrt-x86_64-gcc
-            make
-            zip
 
       - name: Get latest release
         continue-on-error: true
@@ -40,29 +30,113 @@ jobs:
           repository: ${{ github.repository }}
           excludes: draft
 
-      - name: Get version
+      - name: Determine version
+        id: version
         run: |
-          base_ver=`cat vterm.el | grep -Po ';; Version: \K[\d.]+'`
+          base_ver=$(cat vterm.el | grep -Po ';; Version: \K[\d.]+')
           sha=${GITHUB_SHA::6}
-          version=$(echo ${base_ver}.${{ github.run_number }}.$sha)
-          cur_ver=$([[ ${{ steps.cur_release.outcome }} == failure ]] && echo v0 || echo ${{ steps.cur_release.outputs.release }})
-          [[ v$version == $cur_ver ]] && exit 1
-          echo "version=$version" >> $GITHUB_ENV
+          version="${base_ver}.${{ github.run_number }}.${sha}"
+          cur_ver=$([[ "${{ steps.cur_release.outcome }}" == "failure" ]] && echo "v0" || echo "${{ steps.cur_release.outputs.release }}")
+          if [[ "v${version}" == "${cur_ver}" ]]; then
+            echo "Version already exists, skipping"
+            exit 1
+          fi
+          echo "version=${version}" >> $GITHUB_OUTPUT
+          echo "tag=v${version}" >> $GITHUB_OUTPUT
+          echo "Creating release ${version}"
+
+      - name: Create release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Matrix build job: builds all platforms in parallel
+  build:
+    needs: prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x86_64
+            platform: windows
+            msystem: ucrt64
+            packages: mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-libvterm mingw-w64-ucrt-x86_64-libtool mingw-w64-ucrt-x86_64-gcc make zip
+            shell: msys2 {0}
+            artifact_ext: "dll exe"
+
+          - os: windows-11-arm
+            arch: aarch64
+            platform: windows
+            msystem: clangarm64
+            packages: mingw-w64-clang-aarch64-cmake mingw-w64-clang-aarch64-libvterm mingw-w64-clang-aarch64-libtool mingw-w64-clang-aarch64-clang make zip
+            shell: msys2 {0}
+            artifact_ext: "dll exe"
+
+          - os: ubuntu-latest
+            arch: x86_64
+            platform: linux
+            shell: bash
+            artifact_ext: "so"
+
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            platform: linux
+            shell: bash
+            artifact_ext: "so"
+
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Setup MSYS2 for Windows builds
+      - name: Setup MSYS2
+        if: matrix.platform == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          install: ${{ matrix.packages }}
+
+      # Install dependencies for Linux builds
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libtool-bin libvterm-dev zip
 
       - name: Build
         run: |
           cmake -DUSE_SYSTEM_LIBVTERM=OFF -DCMAKE_BUILD_TYPE=Release -Bbuild -S .
           cmake --build build
-          zip vterm-x86_64-windows.zip *.dll *.exe
 
-      - name: Create release
+      - name: Package artifact
+        run: |
+          artifact_name="vterm-module-${{ matrix.arch }}-${{ matrix.platform }}.zip"
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            zip "${artifact_name}" *.dll *.exe
+          else
+            zip "${artifact_name}" *.so
+          fi
+          echo "artifact_name=${artifact_name}" >> $GITHUB_ENV
+
+      - name: Upload artifact to release
         uses: ncipollo/release-action@v1
         with:
-          tag: v${{ env.version }}
-          name: ${{ env.version }}
-          draft: false
-          prerelease: false
-          artifactErrorsFailBuild: true
-          artifacts: vterm-x86_64-windows.zip
+          tag: ${{ needs.prepare-release.outputs.tag }}
+          allowUpdates: true
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true
+          omitDraftDuringUpdate: true
+          omitPrereleaseDuringUpdate: true
+          artifacts: vterm-module-${{ matrix.arch }}-${{ matrix.platform }}.zip
           artifactContentType: application/zip
           token: ${{ secrets.GITHUB_TOKEN }}

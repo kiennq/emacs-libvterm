@@ -9,7 +9,14 @@ else()
    set(LIBVTERM_BUILD_COMMAND "make")
 endif()
 
-add_library(vterm-module MODULE vterm-module.c utf8.c elisp.c)
+# Add source files based on platform
+if(WIN32)
+  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c conpty-proxy/arena.c)
+else()
+  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c)
+endif()
+
+add_library(vterm-module MODULE ${VTERM_MODULE_SOURCES})
 set_target_properties(vterm-module PROPERTIES
   C_STANDARD 99
   C_VISIBILITY_PRESET "hidden"
@@ -17,6 +24,13 @@ set_target_properties(vterm-module PROPERTIES
   PREFIX ""
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}
   )
+
+# Profiling option
+option(ENABLE_PROFILING "Enable performance profiling instrumentation" OFF)
+if(ENABLE_PROFILING)
+  target_compile_definitions(vterm-module PRIVATE VTERM_PROFILE)
+  message(STATUS "Performance profiling enabled")
+endif()
 
 # Set RelWithDebInfo as default build type
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -71,68 +85,88 @@ else()
     message(FATAL_ERROR "libtool not found. Please install libtool")
   endif()
 
-  ExternalProject_add(libtermiwin
-    GIT_REPOSITORY https://github.com/steeviebops/termiWin
-    GIT_TAG 5d5f3474ab823e2c491159cf979ae9fc73f57f9a
-    BUILD_BYPRODUCTS <BINARY_DIR>/libtermiwin.a
-    INSTALL_COMMAND "")
+  # libtermiwin is only needed on Windows for terminal compatibility
+  if(WIN32)
+    # Create a patch script to fix ssize_t typedef conflict on ARM64
+    # termiWin hardcodes "typedef int ssize_t" but on ARM64, ssize_t is already defined as __int64
+    file(WRITE ${CMAKE_BINARY_DIR}/fix_ssize_t.cmake "
+      file(READ \${SOURCE_DIR}/include/termiWin.h TERMIWIN_H_CONTENT)
+      string(REPLACE
+        \"typedef int ssize_t;        /* common 32 bit case */\"
+        \"#ifndef _SSIZE_T_DEFINED\\ntypedef int ssize_t;        /* common 32 bit case */\\n#define _SSIZE_T_DEFINED\\n#endif\"
+        TERMIWIN_H_CONTENT \"\${TERMIWIN_H_CONTENT}\")
+      file(WRITE \${SOURCE_DIR}/include/termiWin.h \"\${TERMIWIN_H_CONTENT}\")
+    ")
 
-  ExternalProject_Get_property(libtermiwin SOURCE_DIR)
-  ExternalProject_Get_property(libtermiwin BINARY_DIR)
+    ExternalProject_add(libtermiwin
+      GIT_REPOSITORY https://github.com/steeviebops/termiWin
+      GIT_TAG 5d5f3474ab823e2c491159cf979ae9fc73f57f9a
+      BUILD_BYPRODUCTS <BINARY_DIR>/libtermiwin.a
+      PATCH_COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=<SOURCE_DIR> -P ${CMAKE_BINARY_DIR}/fix_ssize_t.cmake
+      INSTALL_COMMAND "")
 
-  set(LIBTERMIWIN_INCLUDE_DIR ${SOURCE_DIR}/include)
-  set(LIBTERMIWIN_LIBRARY_DIR ${BINARY_DIR})
-  set(LIBTERMIWIN_LIBRARY ${BINARY_DIR}/libtermiwin.a)
+    ExternalProject_Get_property(libtermiwin SOURCE_DIR)
+    ExternalProject_Get_property(libtermiwin BINARY_DIR)
 
-  # Workaround for https://gitlab.kitware.com/cmake/cmake/issues/15052
-  file(MAKE_DIRECTORY ${LIBTERMIWIN_INCLUDE_DIR})
+    set(LIBTERMIWIN_INCLUDE_DIR ${SOURCE_DIR}/include)
+    set(LIBTERMIWIN_LIBRARY_DIR ${BINARY_DIR})
+    set(LIBTERMIWIN_LIBRARY ${BINARY_DIR}/libtermiwin.a)
 
-  ExternalProject_add(libvterm
-    GIT_REPOSITORY https://github.com/neovim/libvterm.git
-    GIT_TAG dfc4c5e5b3dd99247dc95031a8f40087f181dea5
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${LIBVTERM_BUILD_COMMAND} "CFLAGS=-fPIC -I${LIBTERMIWIN_INCLUDE_DIR}" "LDFLAGS=-static -L${LIBTERMIWIN_LIBRARY_DIR} -ltermiwin"
-    BUILD_IN_SOURCE ON
-    BUILD_BYPRODUCTS <SOURCE_DIR>/.libs/libvterm.a
-    INSTALL_COMMAND "")
+    # Workaround for https://gitlab.kitware.com/cmake/cmake/issues/15052
+    file(MAKE_DIRECTORY ${LIBTERMIWIN_INCLUDE_DIR})
+
+    ExternalProject_add(libvterm
+      GIT_REPOSITORY https://github.com/neovim/libvterm.git
+      GIT_TAG dfc4c5e5b3dd99247dc95031a8f40087f181dea5
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ${LIBVTERM_BUILD_COMMAND} "CFLAGS=-fPIC -I${LIBTERMIWIN_INCLUDE_DIR}" "LDFLAGS=-static -L${LIBTERMIWIN_LIBRARY_DIR} -ltermiwin"
+      BUILD_IN_SOURCE ON
+      BUILD_BYPRODUCTS <SOURCE_DIR>/.libs/libvterm.a
+      INSTALL_COMMAND "")
+
+    add_dependencies(libvterm libtermiwin)
+    add_dependencies(vterm-module libtermiwin)
+  else()
+    # On non-Windows platforms, build libvterm without termiwin
+    ExternalProject_add(libvterm
+      GIT_REPOSITORY https://github.com/neovim/libvterm.git
+      GIT_TAG dfc4c5e5b3dd99247dc95031a8f40087f181dea5
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ${LIBVTERM_BUILD_COMMAND} "CFLAGS=-fPIC"
+      BUILD_IN_SOURCE ON
+      BUILD_BYPRODUCTS <SOURCE_DIR>/.libs/libvterm.a
+      INSTALL_COMMAND "")
+
+    add_dependencies(vterm-module libvterm)
+  endif()
 
   ExternalProject_Get_property(libvterm SOURCE_DIR)
 
   set(LIBVTERM_INCLUDE_DIR ${SOURCE_DIR}/include)
   set(LIBVTERM_LIBRARY ${SOURCE_DIR}/.libs/libvterm.a)
 
-  add_dependencies(libvterm libtermiwin)
-  # add_dependencies(vterm-module libvterm)
-  add_dependencies(vterm-module libtermiwin)
-
   # Workaround for https://gitlab.kitware.com/cmake/cmake/issues/15052
   file(MAKE_DIRECTORY ${LIBVTERM_INCLUDE_DIR})
 endif()
 
-# Build conpty-proxy
+# Build conpty-proxy from local source
 if(WIN32)
-  ExternalProject_add(conpty-proxy
-    GIT_REPOSITORY https://github.com/xhcoding/conpty-proxy.git
-    GIT_TAG v1.0.1
-    INSTALL_DIR ${CMAKE_CURRENT_SOURCE_DIR}
-    INSTALL_COMMAND
-    COMMAND ${CMAKE_COMMAND} -E copy
-    <BINARY_DIR>/conpty_proxy.exe
-    <INSTALL_DIR>/conpty_proxy.exe
-  )
-
+  add_subdirectory(conpty-proxy)
 endif()
-
-add_library(termiwin STATIC IMPORTED)
-set_target_properties(termiwin PROPERTIES IMPORTED_LOCATION ${LIBTERMIWIN_LIBRARY})
-target_include_directories(termiwin INTERFACE ${LIBTERMIWIN_INCLUDE_DIR})
 
 add_library(vterm STATIC IMPORTED)
 set_target_properties(vterm PROPERTIES IMPORTED_LOCATION ${LIBVTERM_LIBRARY})
 target_include_directories(vterm INTERFACE ${LIBVTERM_INCLUDE_DIR})
 
-# Link with libvterm
-target_link_libraries(vterm-module PUBLIC vterm termiwin)
+# Link with libvterm (and termiwin on Windows)
+if(WIN32)
+  add_library(termiwin STATIC IMPORTED)
+  set_target_properties(termiwin PROPERTIES IMPORTED_LOCATION ${LIBTERMIWIN_LIBRARY})
+  target_include_directories(termiwin INTERFACE ${LIBTERMIWIN_INCLUDE_DIR})
+  target_link_libraries(vterm-module PUBLIC vterm termiwin)
+else()
+  target_link_libraries(vterm-module PUBLIC vterm)
+endif()
 
 # Custom run command for testing
 add_custom_target(run
