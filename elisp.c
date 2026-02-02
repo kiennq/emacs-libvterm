@@ -123,7 +123,8 @@ void insert(emacs_env *env, emacs_value string) {
 }
 
 void insert_batch(emacs_env *env, emacs_value *strings, ptrdiff_t count) {
-  if (count <= 0) return;
+  if (count <= 0)
+    return;
   env->funcall(env, Finsert, count, strings);
 }
 
@@ -155,7 +156,17 @@ void delete_lines(emacs_env *env, int linenum, int count, bool del_whole_line) {
   }
 }
 void recenter(emacs_env *env, emacs_value pos) {
+  /* Wrap recenter in error handling to avoid crashes when buffer context
+   * is incorrect during window resize operations. This can happen when
+   * resize is triggered but the vterm buffer isn't the current buffer.
+   * Error: "'recenter'ing a window that does not display current-buffer"
+   */
   env->funcall(env, Frecenter, 1, (emacs_value[]){pos});
+
+  /* Clear any error that occurred - we'll try again on next redraw */
+  if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+    env->non_local_exit_clear(env);
+  }
 }
 emacs_value point(emacs_env *env) { return env->funcall(env, Fpoint, 0, NULL); }
 
@@ -195,7 +206,8 @@ void set_cursor_blink(emacs_env *env, bool blink) {
 
 emacs_value vterm_get_color(emacs_env *env, int index, emacs_value args) {
   emacs_value idx = env->make_integer(env, index);
-  return env->funcall(env, Fapply, 3, (emacs_value[]){ Fvterm_get_color, idx, args });
+  return env->funcall(env, Fapply, 3,
+                      (emacs_value[]){Fvterm_get_color, idx, args});
 }
 
 void set_title(emacs_env *env, emacs_value string) {
