@@ -296,6 +296,8 @@ VTerm on Windows relies on ConPTY (Windows Console Pseudo-Terminal), which requi
 
 - Windows 10 version 1903 (May 2019 Update) or later
 
+**Performance Note**: The Windows implementation has been optimized for performance. See [docs/optimization/SUMMARY.md](docs/optimization/SUMMARY.md) for details on the optimization work that achieved a -66.5% improvement in redraw performance.
+
 ### Compile vterm
 
 Building VTerm requires the MSYS2 environment with appropriate toolchains.

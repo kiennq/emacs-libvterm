@@ -3,3 +3,12 @@
 *.elc
 vterm-module.dll
 conpty_proxy.exe
+
+# Benchmark results
+/benchmark-results/
+*.profdata
+*.profile
+profile*.txt
+stdout*.txt
+benchmark-auto.txt
+vterm-profile.txt

@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -13,6 +14,145 @@
 
 #include <unistd.h>
 #include <vterm.h>
+
+/* ============================================================================
+ * PROFILING INSTRUMENTATION
+ * Compile with -DVTERM_PROFILE to enable performance profiling
+ * ============================================================================
+ */
+#ifdef VTERM_PROFILE
+#ifdef _WIN32
+#include <windows.h>
+typedef struct {
+  LARGE_INTEGER start;
+  LARGE_INTEGER freq;
+} ProfileTimer;
+
+static inline void profile_timer_init(ProfileTimer *timer) {
+  QueryPerformanceFrequency(&timer->freq);
+}
+
+static inline void profile_timer_start(ProfileTimer *timer) {
+  QueryPerformanceCounter(&timer->start);
+}
+
+static inline double profile_timer_elapsed_ms(ProfileTimer *timer) {
+  LARGE_INTEGER end;
+  QueryPerformanceCounter(&end);
+  return (double)(end.QuadPart - timer->start.QuadPart) * 1000.0 /
+         timer->freq.QuadPart;
+}
+#else
+#include <sys/time.h>
+typedef struct {
+  struct timeval start;
+} ProfileTimer;
+
+static inline void profile_timer_init(ProfileTimer *timer) { (void)timer; }
+
+static inline void profile_timer_start(ProfileTimer *timer) {
+  gettimeofday(&timer->start, NULL);
+}
+
+static inline double profile_timer_elapsed_ms(ProfileTimer *timer) {
+  struct timeval end;
+  gettimeofday(&end, NULL);
+  return (end.tv_sec - timer->start.tv_sec) * 1000.0 +
+         (end.tv_usec - timer->start.tv_usec) / 1000.0;
+}
+#endif
+
+typedef struct {
+  const char *name;
+  double total_ms;
+  uint64_t call_count;
+} ProfileStats;
+
+static ProfileStats profile_stats[] = {
+    {"refresh_lines", 0.0, 0},      {"refresh_screen", 0.0, 0},
+    {"refresh_scrollback", 0.0, 0}, {"term_redraw", 0.0, 0},
+    {"render_text", 0.0, 0},        {"fast_compare_cells", 0.0, 0},
+    {"insert_batch", 0.0, 0},       {"fetch_cell", 0.0, 0},
+    {"codepoint_to_utf8", 0.0, 0},  {"adjust_topline", 0.0, 0},
+    {"term_redraw_cursor", 0.0, 0},
+};
+
+#define PROFILE_REFRESH_LINES 0
+#define PROFILE_REFRESH_SCREEN 1
+#define PROFILE_REFRESH_SCROLLBACK 2
+#define PROFILE_TERM_REDRAW 3
+#define PROFILE_RENDER_TEXT 4
+#define PROFILE_FAST_COMPARE_CELLS 5
+#define PROFILE_INSERT_BATCH 6
+#define PROFILE_FETCH_CELL 7
+#define PROFILE_CODEPOINT_TO_UTF8 8
+#define PROFILE_ADJUST_TOPLINE 9
+#define PROFILE_TERM_REDRAW_CURSOR 10
+
+static ProfileTimer _prof_timers[11]; /* One timer per function */
+static int _profile_initialized = 0;
+
+#define PROFILE_START(idx)                                                     \
+  do {                                                                         \
+    if (!_profile_initialized) {                                               \
+      for (int _i = 0; _i < 11; _i++) {                                        \
+        profile_timer_init(&_prof_timers[_i]);                                 \
+      }                                                                        \
+      _profile_initialized = 1;                                                \
+    }                                                                          \
+    profile_timer_start(&_prof_timers[idx]);                                   \
+  } while (0)
+
+#define PROFILE_END(idx)                                                       \
+  do {                                                                         \
+    double _elapsed = profile_timer_elapsed_ms(&_prof_timers[idx]);            \
+    profile_stats[idx].total_ms += _elapsed;                                   \
+    profile_stats[idx].call_count++;                                           \
+  } while (0)
+
+static void profile_print_stats(void) {
+  // Write to file for reliability
+  FILE *logfile =
+      fopen("C:\\Users\\kienn\\.cache\\vterm\\vterm-profile.txt", "w");
+  FILE *outputs[2] = {stderr, logfile};
+
+  for (int out_idx = 0; out_idx < 2; out_idx++) {
+    FILE *out = outputs[out_idx];
+    if (!out)
+      continue;
+
+    fprintf(out, "\n=== Vterm Performance Profile ===\n");
+    fprintf(out, "%-25s %12s %10s %12s\n", "Function", "Total (ms)", "Calls",
+            "Avg (ms)");
+    fprintf(out,
+            "--------------------------------------------------------------\n");
+    for (size_t i = 0; i < sizeof(profile_stats) / sizeof(profile_stats[0]);
+         i++) {
+      if (profile_stats[i].call_count > 0) {
+        double avg = profile_stats[i].total_ms / profile_stats[i].call_count;
+        fprintf(out, "%-25s %12.3f %10llu %12.6f\n", profile_stats[i].name,
+                profile_stats[i].total_ms,
+                (unsigned long long)profile_stats[i].call_count, avg);
+      }
+    }
+    fprintf(out,
+            "--------------------------------------------------------------\n");
+    fflush(out);
+  }
+
+  if (logfile)
+    fclose(logfile);
+}
+
+#else
+#define PROFILE_START(idx)                                                     \
+  do {                                                                         \
+  } while (0)
+#define PROFILE_END(idx)                                                       \
+  do {                                                                         \
+  } while (0)
+static inline void profile_print_stats(void) {}
+#endif
 
 /* Cached Emacs major version to avoid repeated symbol lookups */
 static int cached_emacs_major_version = 0;
@@ -275,23 +415,81 @@ VTERM_INLINE ScrollbackLine *sb_pop_newest(Term *term) {
  */
 
 VTERM_INLINE bool fast_compare_cells(VTermScreenCell *a, VTermScreenCell *b) {
+  PROFILE_START(PROFILE_FAST_COMPARE_CELLS);
+
   /* First compare attributes as a single check - most cells have same attrs */
   if (a->attrs.bold != b->attrs.bold ||
       a->attrs.underline != b->attrs.underline ||
       a->attrs.italic != b->attrs.italic ||
       a->attrs.reverse != b->attrs.reverse ||
       a->attrs.strike != b->attrs.strike) {
+    PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
     return false;
   }
 
   /* Compare colors - use type-specific comparison */
-  if (!vterm_color_is_equal(&a->fg, &b->fg))
+  if (!vterm_color_is_equal(&a->fg, &b->fg)) {
+    PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
     return false;
-  if (!vterm_color_is_equal(&a->bg, &b->bg))
+  }
+  if (!vterm_color_is_equal(&a->bg, &b->bg)) {
+    PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
     return false;
+  }
 
+  PROFILE_END(PROFILE_FAST_COMPARE_CELLS);
   return true;
 }
+
+/* ============================================================================
+ * PERFORMANCE OPTIMIZATION: Arena-based allocations for Windows
+ * Reduces heap fragmentation and improves performance
+ * ============================================================================
+ */
+
+#ifdef _WIN32
+/* Arena-based string duplication (O(1) allocation, no fragmentation) */
+VTERM_INLINE char *arena_strdup(arena_allocator_t *arena, const char *str) {
+  if (str == NULL)
+    return NULL;
+  size_t len = strlen(str) + 1;
+  char *copy = (char *)arena_alloc(arena, len);
+  memcpy(copy, str, len);
+  return copy;
+}
+
+/* Arena-based LineInfo allocation */
+VTERM_INLINE LineInfo *arena_alloc_lineinfo(arena_allocator_t *arena) {
+  LineInfo *info = (LineInfo *)arena_alloc(arena, sizeof(LineInfo));
+  info->directory = NULL;
+  info->prompt_col = -1;
+  return info;
+}
+
+/* Arena-based LineInfo with directory */
+VTERM_INLINE LineInfo *arena_alloc_lineinfo_with_dir(arena_allocator_t *arena,
+                                                     const char *directory) {
+  LineInfo *info = arena_alloc_lineinfo(arena);
+  if (directory != NULL) {
+    info->directory = arena_strdup(arena, directory);
+  }
+  return info;
+}
+
+/* Free LineInfo (handles both malloc and arena allocations) */
+static void free_lineinfo_arena_aware(Term *term, LineInfo *line) {
+  if (line == NULL)
+    return;
+  /* On Windows with arena, directory strings are in arena and don't need
+   * individual free On other platforms or malloc-allocated, we still use
+   * malloc/free */
+  if (line->directory != NULL) {
+    free(line->directory); /* No-op for arena allocations */
+    line->directory = NULL;
+  }
+  free(line); /* No-op for arena allocations */
+}
+#endif
 
 static LineInfo *alloc_lineinfo() {
   LineInfo *info = malloc(sizeof(LineInfo));
@@ -299,6 +497,30 @@ static LineInfo *alloc_lineinfo() {
   info->prompt_col = -1;
   return info;
 }
+
+#ifdef _WIN32
+/* Windows version using arena (requires term context for arena access) */
+static LineInfo *alloc_lineinfo_term(Term *term) {
+  if (term->persistent_arena != NULL) {
+    return arena_alloc_lineinfo(term->persistent_arena);
+  }
+  return alloc_lineinfo(); /* Fallback to malloc */
+}
+
+static LineInfo *alloc_lineinfo_with_dir_term(Term *term, const char *dir) {
+  if (term->persistent_arena != NULL) {
+    return arena_alloc_lineinfo_with_dir(term->persistent_arena, dir);
+  }
+  /* Fallback to malloc */
+  LineInfo *info = alloc_lineinfo();
+  if (dir != NULL) {
+    info->directory = malloc(strlen(dir) + 1);
+    strcpy(info->directory, dir);
+  }
+  return info;
+}
+#endif
+
 static void free_lineinfo(LineInfo *line) {
   if (line == NULL) {
     return;
@@ -364,12 +586,20 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
   } else {
     LineInfo *lastline = term->lines[term->lines_len - 1];
     if (lastline != NULL) {
-      LineInfo *line = alloc_lineinfo();
-      if (lastline->directory != NULL) {
-        line->directory = malloc(1 + strlen(lastline->directory));
-        strcpy(line->directory, lastline->directory);
+#ifdef _WIN32
+      if (term->persistent_arena != NULL) {
+        term->lines[term->lines_len - 1] = arena_alloc_lineinfo_with_dir(
+            term->persistent_arena, lastline->directory);
+      } else
+#endif
+      {
+        LineInfo *line = alloc_lineinfo();
+        if (lastline->directory != NULL) {
+          line->directory = malloc(1 + strlen(lastline->directory));
+          strcpy(line->directory, lastline->directory);
+        }
+        term->lines[term->lines_len - 1] = line;
       }
-      term->lines[term->lines_len - 1] = line;
     }
   }
 
@@ -494,6 +724,8 @@ VTERM_INLINE ScrollbackLine *get_scrollback_line(Term *term,
 }
 
 static void fetch_cell(Term *term, int row, int col, VTermScreenCell *cell) {
+  PROFILE_START(PROFILE_FETCH_CELL);
+
   if (row < 0) {
     ScrollbackLine *sbrow = get_scrollback_line(term, (size_t)(-row - 1));
     if (sbrow != NULL && (size_t)col < sbrow->cols) {
@@ -509,6 +741,8 @@ static void fetch_cell(Term *term, int row, int col, VTermScreenCell *cell) {
   } else {
     vterm_screen_get_cell(term->vts, (VTermPos){.row = row, .col = col}, cell);
   }
+
+  PROFILE_END(PROFILE_FETCH_CELL);
 }
 
 static char *get_row_directory(Term *term, int row) {
@@ -602,11 +836,15 @@ static void goto_col(Term *term, emacs_env *env, int row, int end_col) {
 
 static void refresh_lines(Term *term, emacs_env *env, int start_row,
                           int end_row, int end_col) {
+  PROFILE_START(PROFILE_REFRESH_LINES);
+
   if (end_row < start_row) {
+    PROFILE_END(PROFILE_REFRESH_LINES);
     return;
   }
   int i, j;
 
+/* BASELINE: Original code with realloc for comparison */
 #define PUSH_BUFFER(c)                                                         \
   do {                                                                         \
     if (length == capacity) {                                                  \
@@ -617,11 +855,14 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
     length++;                                                                  \
   } while (0)
 
-#define BATCH_CAPACITY 256
+#define BATCH_CAPACITY                                                         \
+  2048 /* Phase 2: Increased from 256/512 to reduce insert_batch calls */
 #define PUSH_SEGMENT(seg)                                                      \
   do {                                                                         \
     if (batch_count >= BATCH_CAPACITY) {                                       \
+      PROFILE_START(PROFILE_INSERT_BATCH);                                     \
       insert_batch(env, batch, batch_count);                                   \
+      PROFILE_END(PROFILE_INSERT_BATCH);                                       \
       batch_count = 0;                                                         \
     }                                                                          \
     batch[batch_count++] = (seg);                                              \
@@ -629,7 +870,16 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
 
   int capacity = ((end_row - start_row + 1) * end_col) * 4;
   int length = 0;
-  char *buffer = malloc(capacity * sizeof(char));
+  char *buffer;
+#ifdef _WIN32
+  /* Use temp arena for render buffer on Windows (reset each frame) */
+  if (term->temp_arena != NULL) {
+    buffer = (char *)arena_alloc(term->temp_arena, capacity * sizeof(char));
+  } else
+#endif
+  {
+    buffer = malloc(capacity * sizeof(char));
+  }
   VTermScreenCell cell;
   VTermScreenCell lastCell;
   fetch_cell(term, start_row, 0, &lastCell);
@@ -706,19 +956,26 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
 
   /* Flush remaining batch */
   if (batch_count > 0) {
+    PROFILE_START(PROFILE_INSERT_BATCH);
     insert_batch(env, batch, batch_count);
+    PROFILE_END(PROFILE_INSERT_BATCH);
   }
 
 #undef PUSH_BUFFER
 #undef PUSH_SEGMENT
 #undef BATCH_CAPACITY
+#ifndef _WIN32
+  /* Only free if not using arena (arena is reset in bulk) */
   free(buffer);
+#endif
 
+  PROFILE_END(PROFILE_REFRESH_LINES);
   return;
 }
 // Refresh the screen (visible part of the buffer when the terminal is
 // focused) of a invalidated terminal
 static void refresh_screen(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_REFRESH_SCREEN);
   // Term height may have decreased before `invalid_end` reflects it.
   term->invalid_end = MIN(term->invalid_end, term->height);
 
@@ -739,6 +996,7 @@ static void refresh_screen(Term *term, emacs_env *env) {
 
   term->invalid_start = INT_MAX;
   term->invalid_end = -1;
+  PROFILE_END(PROFILE_REFRESH_SCREEN);
 }
 
 static int term_resize(int rows, int cols, void *user_data) {
@@ -763,14 +1021,22 @@ static int term_resize(int rows, int cols, void *user_data) {
       LineInfo *lastline = term->lines[term->lines_len - 1];
       for (int i = term->lines_len; i < rows; i++) {
         if (lastline != NULL) {
-          LineInfo *line = alloc_lineinfo();
-          if (lastline->directory != NULL) {
-            line->directory =
-                malloc(1 + strlen(term->lines[term->lines_len - 1]->directory));
-            strcpy(line->directory,
-                   term->lines[term->lines_len - 1]->directory);
+#ifdef _WIN32
+          if (term->persistent_arena != NULL) {
+            term->lines[i] = arena_alloc_lineinfo_with_dir(
+                term->persistent_arena, lastline->directory);
+          } else
+#endif
+          {
+            LineInfo *line = alloc_lineinfo();
+            if (lastline->directory != NULL) {
+              line->directory = malloc(
+                  1 + strlen(term->lines[term->lines_len - 1]->directory));
+              strcpy(line->directory,
+                     term->lines[term->lines_len - 1]->directory);
+            }
+            term->lines[i] = line;
           }
-          term->lines[i] = line;
         } else {
           term->lines[i] = NULL;
         }
@@ -791,6 +1057,7 @@ static int term_resize(int rows, int cols, void *user_data) {
 
 // Refresh the scrollback of an invalidated terminal.
 static void refresh_scrollback(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_REFRESH_SCROLLBACK);
   int max_line_count = (int)term->sb_current + term->height;
   int del_cnt = 0;
   if (term->sb_clear_pending) {
@@ -839,12 +1106,33 @@ static void refresh_scrollback(Term *term, emacs_env *env) {
 
   term->sb_pending_by_height_decr = 0;
   term->height_resize = 0;
+  PROFILE_END(PROFILE_REFRESH_SCROLLBACK);
 }
 
+/* Cache for adjust_topline optimization - cursor position + viewport info */
+static struct {
+  int cursor_row;
+  int cursor_col;
+  int term_height;
+  int last_win_body_height;
+  bool valid;
+} adjust_topline_cache = {-1, -1, -1, -1, false};
+
 static void adjust_topline(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_ADJUST_TOPLINE);
+
   VTermState *state = vterm_obtain_state(term->vt);
   VTermPos pos;
   vterm_state_get_cursorpos(state, &pos);
+
+  /* OPTIMIZATION 1: Skip if cursor position and terminal height unchanged */
+  if (adjust_topline_cache.valid &&
+      pos.row == adjust_topline_cache.cursor_row &&
+      pos.col == adjust_topline_cache.cursor_col &&
+      term->height == adjust_topline_cache.term_height) {
+    PROFILE_END(PROFILE_ADJUST_TOPLINE);
+    return;
+  }
 
   /* pos.row-term->height is negative, so we backward term->height-pos.row
    * lines from end of buffer
@@ -853,28 +1141,64 @@ static void adjust_topline(Term *term, emacs_env *env) {
   goto_line(env, pos.row - term->height);
   goto_col(term, env, pos.row, pos.col);
 
-  emacs_value windows = get_buffer_window_list(env);
+  /* OPTIMIZATION 2: Get selected window and check if we need expensive
+   * operations */
   emacs_value swindow = selected_window(env);
-  int winnum = env->extract_integer(env, length(env, windows));
-  for (int i = 0; i < winnum; i++) {
-    emacs_value window = nth(env, i, windows);
-    if (eq(env, window, swindow)) {
-      int win_body_height =
-          env->extract_integer(env, window_body_height(env, window));
+  int win_body_height =
+      env->extract_integer(env, window_body_height(env, swindow));
 
-      /* recenter:If ARG is negative, it counts up from the bottom of the
-       * window.  (ARG should be less than the height of the window ) */
-      if (term->height - pos.row <= win_body_height) {
-        recenter(env, env->make_integer(env, pos.row - term->height));
-      } else {
-        recenter(env, env->make_integer(env, pos.row));
-      }
-    } else {
-      if (env->is_not_nil(env, window)) {
-        set_window_point(env, window, point(env));
-      }
+  /* Cache viewport info for next comparison */
+  int old_cursor_row = adjust_topline_cache.cursor_row;
+  adjust_topline_cache.cursor_row = pos.row;
+  adjust_topline_cache.cursor_col = pos.col;
+  adjust_topline_cache.term_height = term->height;
+  adjust_topline_cache.last_win_body_height = win_body_height;
+  adjust_topline_cache.valid = true;
+
+  /* OPTIMIZATION 3: Smart viewport check - skip recenter if cursor safely
+   * within view Calculate cursor position within the visible viewport:
+   * - Bottom of terminal is at line (term->height)
+   * - Cursor is at pos.row from bottom
+   * - Visible viewport shows win_body_height lines
+   */
+  int cursor_from_bottom = term->height - pos.row;
+  int margin = 3; /* Safety margin from viewport edges */
+
+  /* Check if cursor is safely within viewport (not near edges) */
+  bool cursor_in_safe_zone = (cursor_from_bottom > margin) &&
+                             (cursor_from_bottom < win_body_height - margin);
+
+  /* If cursor moved by only a small amount and is in safe zone, skip
+   * recentering */
+  if (cursor_in_safe_zone && old_cursor_row >= 0) {
+    int cursor_delta = abs(pos.row - old_cursor_row);
+    if (cursor_delta <= 2) {
+      /* Minor cursor movement within safe zone - no recenter needed */
+      PROFILE_END(PROFILE_ADJUST_TOPLINE);
+      return;
     }
   }
+
+  /* OPTIMIZATION 4: Only recenter selected window, skip multi-window sync
+   * Original code iterated all windows and synced points. This is expensive.
+   * Most users only care about selected window. If needed, other windows
+   * will sync when they become selected.
+   */
+
+  /* recenter: If ARG is negative, it counts up from the bottom of the
+   * window. (ARG should be less than the height of the window) */
+  if (term->height - pos.row <= win_body_height) {
+    recenter(env, env->make_integer(env, pos.row - term->height));
+  } else {
+    recenter(env, env->make_integer(env, pos.row));
+  }
+
+  PROFILE_END(PROFILE_ADJUST_TOPLINE);
+}
+
+/* Invalidate adjust_topline cache (call when window configuration changes) */
+static void invalidate_adjust_topline_cache(void) {
+  adjust_topline_cache.valid = false;
 }
 
 static void invalidate_terminal(Term *term, int start_row, int end_row) {
@@ -915,6 +1239,8 @@ static int term_movecursor(VTermPos new, VTermPos old, int visible,
 }
 
 static void term_redraw_cursor(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_TERM_REDRAW_CURSOR);
+
   if (term->cursor.cursor_blink_changed) {
     term->cursor.cursor_blink_changed = false;
     set_cursor_blink(env, term->cursor.cursor_blink);
@@ -925,6 +1251,7 @@ static void term_redraw_cursor(Term *term, emacs_env *env) {
 
     if (!term->cursor.cursor_visible) {
       set_cursor_type(env, Qnil);
+      PROFILE_END(PROFILE_TERM_REDRAW_CURSOR);
       return;
     }
 
@@ -943,9 +1270,12 @@ static void term_redraw_cursor(Term *term, emacs_env *env) {
       break;
     }
   }
+
+  PROFILE_END(PROFILE_TERM_REDRAW_CURSOR);
 }
 
 static void term_redraw(Term *term, emacs_env *env) {
+  PROFILE_START(PROFILE_TERM_REDRAW);
   term_redraw_cursor(term, env);
 
   if (term->is_invalidated) {
@@ -994,6 +1324,16 @@ static void term_redraw(Term *term, emacs_env *env) {
   }
 
   term->is_invalidated = false;
+
+#ifdef _WIN32
+  /* Reset temporary arena after each redraw for memory reuse (O(1) operation)
+   */
+  if (term->temp_arena != NULL) {
+    arena_reset(term->temp_arena);
+  }
+#endif
+
+  PROFILE_END(PROFILE_TERM_REDRAW);
 }
 
 static VTermScreenCallbacks vterm_screen_callbacks = {
@@ -1105,9 +1445,11 @@ static int term_settermprop(VTermProp prop, VTermValue *val, void *user_data) {
 
 static emacs_value render_text(emacs_env *env, Term *term, char *buffer,
                                int len, VTermScreenCell *cell) {
+  PROFILE_START(PROFILE_RENDER_TEXT);
   emacs_value text;
   if (len == 0) {
     text = env->make_string(env, "", 0);
+    PROFILE_END(PROFILE_RENDER_TEXT);
     return text;
   } else {
     text = env->make_string(env, buffer, len);
@@ -1159,6 +1501,7 @@ static emacs_value render_text(emacs_env *env, Term *term, char *buffer,
   if (props_len)
     put_text_property(env, text, Qface, properties);
 
+  PROFILE_END(PROFILE_RENDER_TEXT);
   return text;
 }
 static emacs_value render_prompt(emacs_env *env, emacs_value text) {
@@ -1358,6 +1701,29 @@ void term_finalize(void *object) {
   free(term->sb_buffer);
   free(term->lines);
   vterm_free(term->vt);
+
+#ifdef _WIN32
+  /* Destroy arena allocators (frees all allocated memory in bulk - O(1)) */
+  if (term->persistent_arena != NULL) {
+    arena_destroy(term->persistent_arena);
+  }
+  if (term->temp_arena != NULL) {
+    arena_destroy(term->temp_arena);
+  }
+#endif
+
+#ifdef VTERM_PROFILE
+  /* Print profiling stats when term is finalized */
+  /* Write debug marker to see if finalize is called */
+  FILE *debug =
+      fopen("C:\\Users\\kienn\\.cache\\vterm\\finalize-debug.txt", "a");
+  if (debug) {
+    fprintf(debug, "term_finalize called\n");
+    fclose(debug);
+  }
+  profile_print_stats();
+#endif
+
   free(term);
 }
 
@@ -1369,20 +1735,42 @@ static int handle_osc_cmd_51(Term *term, char subCmd, char *buffer) {
       free(term->directory);
       term->directory = NULL;
     }
-    term->directory = malloc(strlen(buffer) + 1);
-    strcpy(term->directory, buffer);
+#ifdef _WIN32
+    if (term->persistent_arena != NULL) {
+      term->directory = arena_strdup(term->persistent_arena, buffer);
+    } else
+#endif
+    {
+      term->directory = malloc(strlen(buffer) + 1);
+      strcpy(term->directory, buffer);
+    }
     term->directory_changed = true;
 
     for (int i = term->cursor.row; i < term->lines_len; i++) {
       if (term->lines[i] == NULL) {
-        term->lines[i] = alloc_lineinfo();
+#ifdef _WIN32
+        if (term->persistent_arena != NULL) {
+          term->lines[i] = arena_alloc_lineinfo(term->persistent_arena);
+        } else
+#endif
+        {
+          term->lines[i] = alloc_lineinfo();
+        }
       }
 
       if (term->lines[i]->directory != NULL) {
         free(term->lines[i]->directory);
       }
-      term->lines[i]->directory = malloc(strlen(buffer) + 1);
-      strcpy(term->lines[i]->directory, buffer);
+#ifdef _WIN32
+      if (term->persistent_arena != NULL) {
+        term->lines[i]->directory =
+            arena_strdup(term->persistent_arena, buffer);
+      } else
+#endif
+      {
+        term->lines[i]->directory = malloc(strlen(buffer) + 1);
+        strcpy(term->lines[i]->directory, buffer);
+      }
       if (i == term->cursor.row) {
         term->lines[i]->prompt_col = term->cursor.col;
       } else {
@@ -1393,14 +1781,28 @@ static int handle_osc_cmd_51(Term *term, char subCmd, char *buffer) {
   } else if (subCmd == 'E') {
     /* "51;E" executes elisp code */
     /* The elisp code is executed in term_redraw */
-    ElispCodeListNode *node = malloc(sizeof(ElispCodeListNode));
-    node->code_len = strlen(buffer);
-    node->code = malloc(node->code_len + 1);
-    strcpy(node->code, buffer);
-    node->next = NULL;
+#ifdef _WIN32
+    if (term->persistent_arena != NULL) {
+      ElispCodeListNode *node = (ElispCodeListNode *)arena_alloc(
+          term->persistent_arena, sizeof(ElispCodeListNode));
+      node->code_len = strlen(buffer);
+      node->code = arena_strdup(term->persistent_arena, buffer);
+      node->next = NULL;
 
-    *(term->elisp_code_p_insert) = node;
-    term->elisp_code_p_insert = &(node->next);
+      *(term->elisp_code_p_insert) = node;
+      term->elisp_code_p_insert = &(node->next);
+    } else
+#endif
+    {
+      ElispCodeListNode *node = malloc(sizeof(ElispCodeListNode));
+      node->code_len = strlen(buffer);
+      node->code = malloc(node->code_len + 1);
+      strcpy(node->code, buffer);
+      node->next = NULL;
+
+      *(term->elisp_code_p_insert) = node;
+      term->elisp_code_p_insert = &(node->next);
+    }
     return 1;
   }
   return 0;
@@ -1614,6 +2016,13 @@ emacs_value Fvterm_new(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
     term->lines[i] = NULL;
   }
 
+#ifdef _WIN32
+  /* Initialize arena allocators for Windows performance optimization */
+  term->persistent_arena = arena_create(65536); /* 64KB for long-lived data */
+  term->temp_arena =
+      arena_create(131072); /* 128KB for temporary render buffers */
+#endif
+
   return env->make_user_ptr(env, term_finalize, term);
 }
 
@@ -1746,7 +2155,662 @@ emacs_value Fvterm_reset_cursor_point(emacs_env *env, ptrdiff_t nargs,
   return point(env);
 }
 
+#ifdef _WIN32
+/* ============================================================================
+ * IN-PROCESS CONPTY IMPLEMENTATION
+ * Eliminates the need for conpty_proxy.exe by handling ConPTY directly
+ * Uses open_channel for thread-safe notification to Emacs event loop
+ * ============================================================================
+ */
+
+#include <io.h> /* for _write on Windows */
+
+/* Debug logging - writes to file for visibility */
+#define CONPTY_DEBUG 1
+#ifdef CONPTY_DEBUG
+static FILE *g_conpty_debug_file = NULL;
+
+static void conpty_debug_init(void) {
+  if (!g_conpty_debug_file) {
+    g_conpty_debug_file =
+        fopen("C:\\Users\\kingu\\.cache\\vterm\\conpty_debug.log", "a");
+    if (g_conpty_debug_file) {
+      fprintf(g_conpty_debug_file, "\n=== New session started ===\n");
+      fflush(g_conpty_debug_file);
+    }
+  }
+}
+
+static void conpty_debug(const char *fmt, ...) {
+  conpty_debug_init();
+  if (g_conpty_debug_file) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_conpty_debug_file, fmt, args);
+    va_end(args);
+    fflush(g_conpty_debug_file);
+  }
+}
+#define CONPTY_LOG(...) conpty_debug(__VA_ARGS__)
+#else
+#define CONPTY_LOG(...) ((void)0)
+#endif
+
+/* PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE may not be defined in older SDKs */
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE                                    \
+  ProcThreadAttributeValue(22, FALSE, TRUE, FALSE)
+#endif
+
+/* ConPTY API function pointers */
+static CreatePseudoConsole_t g_CreatePseudoConsole = NULL;
+static ResizePseudoConsole_t g_ResizePseudoConsole = NULL;
+static ClosePseudoConsole_t g_ClosePseudoConsole = NULL;
+static int g_conpty_api_initialized = 0;
+
+/* Initialize ConPTY API (load from kernel32.dll) */
+static int conpty_api_init(void) {
+  if (g_conpty_api_initialized == -1)
+    return -1;
+  if (g_conpty_api_initialized == 1)
+    return 0;
+
+  HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  if (!kernel32) {
+    g_conpty_api_initialized = -1;
+    return -1;
+  }
+
+  g_CreatePseudoConsole =
+      (CreatePseudoConsole_t)GetProcAddress(kernel32, "CreatePseudoConsole");
+  g_ResizePseudoConsole =
+      (ResizePseudoConsole_t)GetProcAddress(kernel32, "ResizePseudoConsole");
+  g_ClosePseudoConsole =
+      (ClosePseudoConsole_t)GetProcAddress(kernel32, "ClosePseudoConsole");
+
+  if (!g_CreatePseudoConsole || !g_ResizePseudoConsole ||
+      !g_ClosePseudoConsole) {
+    g_conpty_api_initialized = -1;
+    return -1;
+  }
+
+  g_conpty_api_initialized = 1;
+  return 0;
+}
+
+/* IOCP completion key - not currently used, kept for future optimization */
+#define CONPTY_COMPLETION_KEY_READ 1
+
+/* Background thread that reads ConPTY output and notifies Emacs
+ * Uses simple blocking reads - simpler and works with regular pipes
+ */
+static DWORD WINAPI conpty_output_thread(LPVOID param) {
+  Term *term = (Term *)param;
+  ConPTYState *state = term->conpty;
+  DWORD bytes_read;
+  int current_buf = 0;
+
+  CONPTY_LOG("conpty_output_thread: started\n");
+
+  while (InterlockedCompareExchange(&state->running, 1, 1) == 1) {
+    /* Simple blocking read from ConPTY output pipe */
+    BOOL ok = ReadFile(state->pty_output, state->output_buf[current_buf],
+                       sizeof(state->output_buf[0]), &bytes_read, NULL);
+
+    if (!ok || bytes_read == 0) {
+      DWORD err = GetLastError();
+      CONPTY_LOG("conpty_output_thread: ReadFile failed/EOF, error=%lu\n", err);
+      /* Pipe broken or EOF - shell likely exited */
+      break;
+    }
+
+    CONPTY_LOG("conpty_output_thread: read %lu bytes\n", bytes_read);
+
+    /* Copy to pending buffer for Emacs */
+    EnterCriticalSection(&state->pending_lock);
+    size_t space = sizeof(state->pending_output) - state->pending_output_len;
+    size_t to_copy = (bytes_read < space) ? bytes_read : space;
+    if (to_copy > 0) {
+      memcpy(state->pending_output + state->pending_output_len,
+             state->output_buf[current_buf], to_copy);
+      state->pending_output_len += to_copy;
+    }
+    LeaveCriticalSection(&state->pending_lock);
+
+    /* Toggle double buffer for next read */
+    current_buf = 1 - current_buf;
+
+    /* Notify Emacs via open_channel FD (thread-safe!) */
+    if (state->notify_fd >= 0) {
+      _write(state->notify_fd, "1", 1);
+    }
+  }
+
+  CONPTY_LOG("conpty_output_thread: exiting\n");
+  return 0;
+}
+
+/* Cleanup ConPTY resources */
+static void conpty_cleanup(Term *term) {
+  if (!term->conpty)
+    return;
+
+  ConPTYState *state = term->conpty;
+
+  /* Signal thread to stop */
+  InterlockedExchange(&state->running, 0);
+
+  /* Cancel pending I/O */
+  if (state->pty_output && state->pty_output != INVALID_HANDLE_VALUE) {
+    CancelIo(state->pty_output);
+  }
+
+  /* Wait for thread with timeout */
+  if (state->iocp_thread && state->iocp_thread != INVALID_HANDLE_VALUE) {
+    WaitForSingleObject(state->iocp_thread, 2000);
+    CloseHandle(state->iocp_thread);
+    state->iocp_thread = NULL;
+  }
+
+  /* Close IOCP */
+  if (state->iocp && state->iocp != INVALID_HANDLE_VALUE) {
+    CloseHandle(state->iocp);
+    state->iocp = NULL;
+  }
+
+  /* Close shell process */
+  if (state->shell_process && state->shell_process != INVALID_HANDLE_VALUE) {
+    TerminateProcess(state->shell_process, 0);
+    CloseHandle(state->shell_process);
+    state->shell_process = NULL;
+  }
+
+  /* Close PTY handles */
+  if (state->pty_input && state->pty_input != INVALID_HANDLE_VALUE) {
+    CloseHandle(state->pty_input);
+    state->pty_input = NULL;
+  }
+  if (state->pty_output && state->pty_output != INVALID_HANDLE_VALUE) {
+    CloseHandle(state->pty_output);
+    state->pty_output = NULL;
+  }
+
+  /* Close pseudo console */
+  if (state->hpc) {
+    g_ClosePseudoConsole(state->hpc);
+    state->hpc = NULL;
+  }
+
+  /* Delete critical section */
+  DeleteCriticalSection(&state->pending_lock);
+
+  /* Note: state itself is in arena, will be freed with term */
+  term->conpty = NULL;
+}
+
+/* Initialize in-process ConPTY
+ * Args: term, notify_pipe, shell_cmd, width, height
+ */
+emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
+                               emacs_value args[], void *data) {
+  (void)data;
+
+  CONPTY_LOG("Fvterm_conpty_init: nargs=%td\n", nargs);
+
+  if (nargs < 5) {
+    CONPTY_LOG("Fvterm_conpty_init: nargs < 5, returning nil\n");
+    return Qnil;
+  }
+
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term) {
+    CONPTY_LOG("Fvterm_conpty_init: term is NULL\n");
+    return Qnil;
+  }
+  CONPTY_LOG("Fvterm_conpty_init: term=%p\n", (void *)term);
+
+  /* Initialize ConPTY API if needed */
+  if (conpty_api_init() != 0) {
+    CONPTY_LOG("Fvterm_conpty_init: conpty_api_init failed\n");
+    return Qnil;
+  }
+  CONPTY_LOG("Fvterm_conpty_init: conpty_api_init OK\n");
+
+  /* Extract shell command */
+  ptrdiff_t shell_len = 0;
+  env->copy_string_contents(env, args[2], NULL, &shell_len);
+  char *shell_cmd = (char *)malloc(shell_len);
+  if (!shell_cmd) {
+    CONPTY_LOG("Fvterm_conpty_init: malloc for shell_cmd failed\n");
+    return Qnil;
+  }
+  env->copy_string_contents(env, args[2], shell_cmd, &shell_len);
+  CONPTY_LOG("Fvterm_conpty_init: shell_cmd='%s'\n", shell_cmd);
+
+  int width = env->extract_integer(env, args[3]);
+  int height = env->extract_integer(env, args[4]);
+  CONPTY_LOG("Fvterm_conpty_init: width=%d height=%d\n", width, height);
+
+  if (width <= 0 || height <= 0) {
+    CONPTY_LOG("Fvterm_conpty_init: invalid dimensions\n");
+    free(shell_cmd);
+    return Qnil;
+  }
+
+  /* Allocate ConPTY state (use arena for automatic cleanup) */
+  CONPTY_LOG("Fvterm_conpty_init: persistent_arena=%p\n",
+             (void *)term->persistent_arena);
+  ConPTYState *state =
+      (ConPTYState *)arena_alloc(term->persistent_arena, sizeof(ConPTYState));
+  if (!state) {
+    CONPTY_LOG("Fvterm_conpty_init: arena_alloc failed\n");
+    free(shell_cmd);
+    return Qnil;
+  }
+  memset(state, 0, sizeof(ConPTYState));
+  term->conpty = state;
+  CONPTY_LOG("Fvterm_conpty_init: ConPTYState allocated at %p\n",
+             (void *)state);
+
+  /* Initialize critical section */
+  InitializeCriticalSection(&state->pending_lock);
+  state->running = 1;
+  state->notify_fd = -1;
+
+  /* Get notify FD via open_channel (Emacs 28+) */
+  CONPTY_LOG("Fvterm_conpty_init: calling open_channel...\n");
+  state->notify_fd = env->open_channel(env, args[1]);
+  CONPTY_LOG("Fvterm_conpty_init: notify_fd=%d\n", state->notify_fd);
+  if (state->notify_fd < 0) {
+    CONPTY_LOG("Fvterm_conpty_init: open_channel failed\n");
+    DeleteCriticalSection(&state->pending_lock);
+    term->conpty = NULL;
+    free(shell_cmd);
+    return Qnil;
+  }
+
+  /* Create pipes for ConPTY */
+  CONPTY_LOG("Fvterm_conpty_init: creating pipes...\n");
+  HANDLE in_read = INVALID_HANDLE_VALUE, in_write = INVALID_HANDLE_VALUE;
+  HANDLE out_read = INVALID_HANDLE_VALUE, out_write = INVALID_HANDLE_VALUE;
+  SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+
+  if (!CreatePipe(&in_read, &in_write, &sa, 0) ||
+      !CreatePipe(&out_read, &out_write, &sa, 0)) {
+    CONPTY_LOG("Fvterm_conpty_init: CreatePipe failed, error=%lu\n",
+               GetLastError());
+    if (in_read != INVALID_HANDLE_VALUE)
+      CloseHandle(in_read);
+    if (in_write != INVALID_HANDLE_VALUE)
+      CloseHandle(in_write);
+    if (out_read != INVALID_HANDLE_VALUE)
+      CloseHandle(out_read);
+    if (out_write != INVALID_HANDLE_VALUE)
+      CloseHandle(out_write);
+    DeleteCriticalSection(&state->pending_lock);
+    term->conpty = NULL;
+    free(shell_cmd);
+    return Qnil;
+  }
+  CONPTY_LOG("Fvterm_conpty_init: pipes created OK\n");
+
+  /* Create pseudo console */
+  CONPTY_LOG("Fvterm_conpty_init: creating pseudo console...\n");
+  COORD size = {(SHORT)width, (SHORT)height};
+  HRESULT hr = g_CreatePseudoConsole(size, in_read, out_write, 0, &state->hpc);
+  CONPTY_LOG("Fvterm_conpty_init: CreatePseudoConsole hr=0x%lx\n",
+             (unsigned long)hr);
+
+  /* Close handles now owned by ConPTY */
+  CloseHandle(in_read);
+  CloseHandle(out_write);
+
+  if (FAILED(hr)) {
+    CONPTY_LOG("Fvterm_conpty_init: CreatePseudoConsole FAILED\n");
+    CloseHandle(in_write);
+    CloseHandle(out_read);
+    DeleteCriticalSection(&state->pending_lock);
+    term->conpty = NULL;
+    free(shell_cmd);
+    return Qnil;
+  }
+  CONPTY_LOG("Fvterm_conpty_init: pseudo console created OK\n");
+
+  state->pty_input = in_write;
+  state->pty_output = out_read;
+
+  /* Spawn shell process attached to ConPTY */
+  CONPTY_LOG("Fvterm_conpty_init: spawning shell process...\n");
+  STARTUPINFOEXW si;
+  memset(&si, 0, sizeof(si));
+  si.StartupInfo.cb = sizeof(si);
+
+  size_t attr_size = 0;
+  InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+  CONPTY_LOG("Fvterm_conpty_init: attr_size=%zu\n", attr_size);
+  si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+  if (!si.lpAttributeList) {
+    CONPTY_LOG("Fvterm_conpty_init: malloc for attr list failed\n");
+    conpty_cleanup(term);
+    free(shell_cmd);
+    return Qnil;
+  }
+
+  if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0,
+                                         &attr_size) ||
+      !UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                 state->hpc, sizeof(state->hpc), NULL, NULL)) {
+    CONPTY_LOG("Fvterm_conpty_init: InitializeProcThreadAttributeList or "
+               "UpdateProcThreadAttribute failed, error=%lu\n",
+               GetLastError());
+    free(si.lpAttributeList);
+    conpty_cleanup(term);
+    free(shell_cmd);
+    return Qnil;
+  }
+  CONPTY_LOG("Fvterm_conpty_init: attribute list initialized OK\n");
+
+  /* Convert shell command to wide string */
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, shell_cmd, -1, NULL, 0);
+  wchar_t *wshell = (wchar_t *)malloc(wlen * sizeof(wchar_t));
+  if (!wshell) {
+    CONPTY_LOG("Fvterm_conpty_init: malloc for wshell failed\n");
+    DeleteProcThreadAttributeList(si.lpAttributeList);
+    free(si.lpAttributeList);
+    conpty_cleanup(term);
+    free(shell_cmd);
+    return Qnil;
+  }
+  MultiByteToWideChar(CP_UTF8, 0, shell_cmd, -1, wshell, wlen);
+  free(shell_cmd);
+  CONPTY_LOG("Fvterm_conpty_init: shell command converted to wide string\n");
+
+  PROCESS_INFORMATION pi;
+  memset(&pi, 0, sizeof(pi));
+
+  CONPTY_LOG("Fvterm_conpty_init: calling CreateProcessW...\n");
+  BOOL created = CreateProcessW(NULL, wshell, NULL, NULL, FALSE,
+                                EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                                &si.StartupInfo, &pi);
+  CONPTY_LOG("Fvterm_conpty_init: CreateProcessW returned %d, error=%lu\n",
+             created, GetLastError());
+
+  free(wshell);
+  DeleteProcThreadAttributeList(si.lpAttributeList);
+  free(si.lpAttributeList);
+
+  if (!created) {
+    CONPTY_LOG("Fvterm_conpty_init: CreateProcessW FAILED\n");
+    conpty_cleanup(term);
+    return Qnil;
+  }
+  CONPTY_LOG("Fvterm_conpty_init: shell process created, pid=%lu\n",
+             pi.dwProcessId);
+
+  state->shell_process = pi.hProcess;
+  CloseHandle(pi.hThread);
+
+  /* No IOCP needed - using simple blocking reads in background thread */
+  state->iocp = NULL;
+
+  /* Start background output thread */
+  CONPTY_LOG("Fvterm_conpty_init: starting output thread...\n");
+  state->iocp_thread =
+      CreateThread(NULL, 0, conpty_output_thread, term, 0, NULL);
+  if (!state->iocp_thread) {
+    CONPTY_LOG("Fvterm_conpty_init: CreateThread failed, error=%lu\n",
+               GetLastError());
+    conpty_cleanup(term);
+    return Qnil;
+  }
+  CONPTY_LOG("Fvterm_conpty_init: output thread started, SUCCESS!\n");
+
+  return Qt;
+}
+
+/* Read pending output from ConPTY */
+emacs_value Fvterm_conpty_read_pending(emacs_env *env, ptrdiff_t nargs,
+                                       emacs_value args[], void *data) {
+  (void)data;
+  (void)nargs;
+
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term || !term->conpty)
+    return Qnil;
+
+  ConPTYState *state = term->conpty;
+  emacs_value result = Qnil;
+
+  EnterCriticalSection(&state->pending_lock);
+  if (state->pending_output_len > 0) {
+    result = env->make_string(env, state->pending_output,
+                              (ptrdiff_t)state->pending_output_len);
+    state->pending_output_len = 0;
+  }
+  LeaveCriticalSection(&state->pending_lock);
+
+  return result;
+}
+
+/* Write input directly to ConPTY (fast path - no pipes through Emacs) */
+emacs_value Fvterm_conpty_write(emacs_env *env, ptrdiff_t nargs,
+                                emacs_value args[], void *data) {
+  (void)data;
+
+  if (nargs < 2) {
+    CONPTY_LOG("Fvterm_conpty_write: nargs < 2\n");
+    return Qnil;
+  }
+
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term || !term->conpty) {
+    CONPTY_LOG("Fvterm_conpty_write: term=%p conpty=%p\n", (void *)term,
+               term ? (void *)term->conpty : NULL);
+    return Qnil;
+  }
+
+  ptrdiff_t len = 0;
+  env->copy_string_contents(env, args[1], NULL, &len);
+  if (len <= 1) {
+    CONPTY_LOG("Fvterm_conpty_write: empty string\n");
+    return env->make_integer(env, 0); /* Empty string (just null terminator) */
+  }
+
+  char *bytes = (char *)malloc(len);
+  if (!bytes) {
+    CONPTY_LOG("Fvterm_conpty_write: malloc failed\n");
+    return Qnil;
+  }
+  env->copy_string_contents(env, args[1], bytes, &len);
+
+  CONPTY_LOG("Fvterm_conpty_write: writing %td bytes: ", len - 1);
+  for (ptrdiff_t i = 0; i < len - 1 && i < 20; i++) {
+    CONPTY_LOG("%02x ", (unsigned char)bytes[i]);
+  }
+  CONPTY_LOG("\n");
+
+  DWORD written = 0;
+  BOOL ok = WriteFile(term->conpty->pty_input, bytes, (DWORD)(len - 1),
+                      &written, NULL);
+  CONPTY_LOG("Fvterm_conpty_write: WriteFile ok=%d written=%lu error=%lu\n", ok,
+             written, GetLastError());
+  free(bytes);
+
+  return env->make_integer(env, written);
+}
+
+/* Resize ConPTY directly (no proxy needed) */
+emacs_value Fvterm_conpty_resize(emacs_env *env, ptrdiff_t nargs,
+                                 emacs_value args[], void *data) {
+  (void)data;
+
+  CONPTY_LOG("Fvterm_conpty_resize: called with nargs=%td\n", nargs);
+
+  if (nargs < 3) {
+    CONPTY_LOG("Fvterm_conpty_resize: ERROR nargs < 3\n");
+    return Qnil;
+  }
+
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term) {
+    CONPTY_LOG("Fvterm_conpty_resize: ERROR term is NULL\n");
+    return Qnil;
+  }
+  if (!term->conpty) {
+    CONPTY_LOG("Fvterm_conpty_resize: ERROR term->conpty is NULL\n");
+    return Qnil;
+  }
+  if (!term->conpty->hpc) {
+    CONPTY_LOG("Fvterm_conpty_resize: ERROR term->conpty->hpc is NULL\n");
+    return Qnil;
+  }
+
+  int width = env->extract_integer(env, args[1]);
+  int height = env->extract_integer(env, args[2]);
+
+  CONPTY_LOG("Fvterm_conpty_resize: width=%d height=%d\n", width, height);
+
+  if (width <= 0 || height <= 0) {
+    CONPTY_LOG("Fvterm_conpty_resize: ERROR invalid dimensions\n");
+    return Qnil;
+  }
+
+  COORD size = {(SHORT)width, (SHORT)height};
+  HRESULT hr = g_ResizePseudoConsole(term->conpty->hpc, size);
+
+  CONPTY_LOG("Fvterm_conpty_resize: ResizePseudoConsole hr=0x%lx %s\n", hr,
+             SUCCEEDED(hr) ? "SUCCESS" : "FAILED");
+
+  return SUCCEEDED(hr) ? Qt : Qnil;
+}
+
+/* Check if ConPTY shell process is still alive */
+emacs_value Fvterm_conpty_is_alive(emacs_env *env, ptrdiff_t nargs,
+                                   emacs_value args[], void *data) {
+  (void)data;
+  (void)nargs;
+
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term || !term->conpty || !term->conpty->shell_process)
+    return Qnil;
+
+  DWORD exit_code;
+  if (GetExitCodeProcess(term->conpty->shell_process, &exit_code)) {
+    return (exit_code == STILL_ACTIVE) ? Qt : Qnil;
+  }
+
+  return Qnil;
+}
+
+/* Kill ConPTY and cleanup resources */
+emacs_value Fvterm_conpty_kill(emacs_env *env, ptrdiff_t nargs,
+                               emacs_value args[], void *data) {
+  (void)data;
+  (void)nargs;
+
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term)
+    return Qnil;
+
+  conpty_cleanup(term);
+  return Qt;
+}
+
+/* ============================================================================
+ * END IN-PROCESS CONPTY IMPLEMENTATION
+ * ============================================================================
+ */
+
+// Structure to pass resize data to threadpool worker
+typedef struct {
+  char pipe_name[256];
+  char message[64];
+  int msg_len;
+} resize_work_t;
+
+// Threadpool worker that performs the blocking pipe write
+static DWORD WINAPI resize_worker(LPVOID param) {
+  resize_work_t *work = (resize_work_t *)param;
+
+  // Open named pipe for writing
+  HANDLE pipe = CreateFileA(work->pipe_name, GENERIC_WRITE, 0, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (pipe != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(pipe, work->message, work->msg_len, &written, NULL);
+    CloseHandle(pipe);
+  }
+
+  free(work);
+  return 0;
+}
+
+// Windows-specific function to write to ConPTY control pipe asynchronously
+// Uses threadpool to avoid blocking Emacs main thread
+emacs_value Fvterm_conpty_resize_async(emacs_env *env, ptrdiff_t nargs,
+                                       emacs_value args[], void *data) {
+  // Args: conpty-id width height
+  if (nargs < 3) {
+    return Qnil;
+  }
+
+  // Extract arguments
+  ptrdiff_t id_size = 0;
+  env->copy_string_contents(env, args[0], NULL, &id_size);
+  char *conpty_id = (char *)malloc(id_size);
+  env->copy_string_contents(env, args[0], conpty_id, &id_size);
+
+  int width = env->extract_integer(env, args[1]);
+  int height = env->extract_integer(env, args[2]);
+
+  if (width <= 0 || height <= 0) {
+    free(conpty_id);
+    return Qnil;
+  }
+
+  // Allocate work item for threadpool
+  resize_work_t *work = (resize_work_t *)malloc(sizeof(resize_work_t));
+  if (!work) {
+    free(conpty_id);
+    return Qnil;
+  }
+
+  // Prepare work item
+  snprintf(work->pipe_name, sizeof(work->pipe_name),
+           "\\\\.\\pipe\\conpty-proxy-ctrl-%s", conpty_id);
+  work->msg_len =
+      snprintf(work->message, sizeof(work->message), "%d %d", width, height);
+  free(conpty_id);
+
+  // Queue work to threadpool - returns immediately
+  if (!QueueUserWorkItem(resize_worker, work, WT_EXECUTEDEFAULT)) {
+    free(work);
+    return Qnil;
+  }
+
+  // Return success immediately (work is queued)
+  return Qt;
+}
+#endif
+
+#ifdef VTERM_PROFILE
+/* Elisp-callable function to print profiling stats */
+static emacs_value Fvterm_print_profile(emacs_env *env, ptrdiff_t nargs,
+                                        emacs_value args[], void *data) {
+  (void)nargs;
+  (void)args;
+  (void)data;
+  profile_print_stats();
+  return Qt;
+}
+#endif
+
 int emacs_module_init(struct emacs_runtime *ert) {
+  /* Require Emacs 28+ for open_channel support (used by in-process ConPTY) */
+  if ((size_t)ert->size < sizeof(struct emacs_runtime))
+    return 1; /* Emacs too old */
+
   emacs_env *env = ert->get_environment(ert);
 
   // Symbols;
@@ -1861,6 +2925,47 @@ int emacs_module_init(struct emacs_runtime *ert) {
   fun = env->make_function(env, 1, 1, Fvterm_get_icrnl,
                            "Get the icrnl state of the pty", NULL);
   bind_function(env, "vterm--get-icrnl", fun);
+
+#ifdef _WIN32
+  fun = env->make_function(env, 3, 3, Fvterm_conpty_resize_async,
+                           "Send resize command asynchronously to ConPTY "
+                           "control pipe via threadpool.",
+                           NULL);
+  bind_function(env, "vterm--conpty-resize-async", fun);
+
+  /* In-process ConPTY functions */
+  fun = env->make_function(env, 5, 5, Fvterm_conpty_init,
+                           "Initialize in-process ConPTY. "
+                           "Args: term notify-pipe shell width height",
+                           NULL);
+  bind_function(env, "vterm--conpty-init", fun);
+
+  fun = env->make_function(env, 1, 1, Fvterm_conpty_read_pending,
+                           "Read pending output from ConPTY.", NULL);
+  bind_function(env, "vterm--conpty-read-pending", fun);
+
+  fun = env->make_function(env, 2, 2, Fvterm_conpty_write,
+                           "Write input directly to ConPTY.", NULL);
+  bind_function(env, "vterm--conpty-write", fun);
+
+  fun = env->make_function(env, 3, 3, Fvterm_conpty_resize,
+                           "Resize ConPTY directly.", NULL);
+  bind_function(env, "vterm--conpty-resize", fun);
+
+  fun = env->make_function(env, 1, 1, Fvterm_conpty_is_alive,
+                           "Check if ConPTY shell is still running.", NULL);
+  bind_function(env, "vterm--conpty-is-alive", fun);
+
+  fun = env->make_function(env, 1, 1, Fvterm_conpty_kill,
+                           "Kill ConPTY and cleanup resources.", NULL);
+  bind_function(env, "vterm--conpty-kill", fun);
+#endif
+
+#ifdef VTERM_PROFILE
+  fun = env->make_function(env, 0, 0, Fvterm_print_profile,
+                           "Print vterm profiling statistics.", NULL);
+  bind_function(env, "vterm--print-profile", fun);
+#endif
 
   /* Cache the Emacs major version for performance */
   cached_emacs_major_version =
