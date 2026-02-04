@@ -39,16 +39,13 @@ gcc -c vterm-module.c -I. -Ibuild/libvterm-prefix/src/libvterm/include \
 ### Deploy
 ```bash
 cp vterm-module.dll /c/Users/$USER/.cache/vterm/
-cp build/conpty-proxy/conpty_proxy.exe /c/Users/$USER/.cache/vterm/
 ```
 
-**If DLL/EXE is locked by Emacs**: Rename old files first, then copy new ones:
+**If DLL is locked by Emacs**: Rename old file first, then copy new one:
 ```bash
 DEPLOY_DIR=/c/Users/$USER/.cache/vterm
 mv $DEPLOY_DIR/vterm-module.dll $DEPLOY_DIR/vterm-module.dll.old 2>/dev/null
-mv $DEPLOY_DIR/conpty_proxy.exe $DEPLOY_DIR/conpty_proxy.exe.old 2>/dev/null
 cp vterm-module.dll $DEPLOY_DIR/
-cp build/conpty-proxy/conpty_proxy.exe $DEPLOY_DIR/
 ```
 Windows allows renaming in-use files. The old DLL stays loaded until Emacs restarts.
 
@@ -61,7 +58,7 @@ Manual testing (no automated test suite):
 
 ## Code Style
 
-### C Code (vterm-module.c, conpty_proxy.c, arena.c)
+### C Code (vterm-module.c, arena.c)
 
 **Formatting**:
 - 2-space indentation
@@ -128,18 +125,17 @@ VTERM_HOT                          // Hot functions
 | File | Purpose |
 |------|---------|
 | `vterm.el` | Emacs Lisp frontend, user interaction |
-| `vterm-module.c` | C module, libvterm bridge, rendering |
+| `vterm-module.c` | C module, libvterm bridge, rendering, in-process ConPTY |
 | `vterm-module.h` | Type definitions, function declarations |
 | `elisp.c` | Emacs symbol/function caching |
-| `conpty-proxy/conpty_proxy.c` | Windows PTY bridge (external process) |
-| `conpty-proxy/arena.c` | Arena allocator for O(1) memory |
+| `conpty-proxy/arena.c` | Arena allocator for O(1) memory (used by vterm-module.c) |
 
 ## Architecture Notes
 
-### Windows ConPTY Flow
+### Windows ConPTY Flow (In-Process)
 ```
 User Input -> vterm.el -> vterm-module.dll -> ConPTY pipe -> Shell
-Shell Output <- ConPTY pipe <- IOCP thread <- vterm-module.dll <- display
+Shell Output <- ConPTY pipe <- background thread <- vterm-module.dll <- display
 ```
 
 ### Memory Management (Windows)
@@ -161,9 +157,7 @@ Shell Output <- ConPTY pipe <- IOCP thread <- vterm-module.dll <- display
 4. Expose in `vterm.el` if needed
 
 ### Modifying ConPTY Behavior
-1. Edit `conpty-proxy/conpty_proxy.c` for external proxy
-2. Edit ConPTY section in `vterm-module.c` for in-process
-3. Rebuild both targets if changing interface
+Edit ConPTY section in `vterm-module.c` (search for `#ifdef _WIN32` and ConPTY functions).
 
 ## Don'ts
 

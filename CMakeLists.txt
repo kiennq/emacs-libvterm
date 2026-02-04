@@ -149,10 +149,8 @@ else()
   file(MAKE_DIRECTORY ${LIBVTERM_INCLUDE_DIR})
 endif()
 
-# Build conpty-proxy from local source
-if(WIN32)
-  add_subdirectory(conpty-proxy)
-endif()
+# conpty-proxy is no longer needed - ConPTY is handled in-process
+# The arena.c from conpty-proxy is still used by vterm-module.c
 
 add_library(vterm STATIC IMPORTED)
 set_target_properties(vterm PROPERTIES IMPORTED_LOCATION ${LIBVTERM_LIBRARY})
