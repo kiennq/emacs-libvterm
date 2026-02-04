@@ -8,6 +8,36 @@
 
 #ifdef _WIN32
 #include "conpty-proxy/arena.h"
+#include <windows.h>
+
+/* ConPTY API function pointers (loaded dynamically) */
+typedef HRESULT(WINAPI *CreatePseudoConsole_t)(COORD, HANDLE, HANDLE, DWORD,
+                                               HPCON *);
+typedef HRESULT(WINAPI *ResizePseudoConsole_t)(HPCON, COORD);
+typedef void(WINAPI *ClosePseudoConsole_t)(HPCON);
+
+/* In-process ConPTY state */
+typedef struct ConPTYState {
+  HPCON hpc;            /* Pseudo console handle */
+  HANDLE pty_input;     /* Write to shell stdin */
+  HANDLE pty_output;    /* Read from shell stdout (async) */
+  HANDLE shell_process; /* Shell process handle */
+
+  HANDLE iocp;        /* I/O completion port */
+  HANDLE iocp_thread; /* Background reader thread */
+  int notify_fd;      /* FD from open_channel (write to wake Emacs) */
+
+  char output_buf[2][131072]; /* 128KB double buffer for async reads */
+  int output_buf_active;      /* Active buffer index (0 or 1) */
+
+  char pending_output[262144]; /* 256KB pending for Emacs to read */
+  size_t pending_output_len;
+  CRITICAL_SECTION pending_lock; /* Protect pending buffer access */
+
+  volatile LONG running;      /* Thread control flag (1 = running, 0 = stop) */
+  OVERLAPPED read_overlapped; /* For async ReadFile */
+} ConPTYState;
+
 #endif
 
 // https://gcc.gnu.org/wiki/Visibility
@@ -150,6 +180,9 @@ typedef struct Term {
   arena_allocator_t
       *persistent_arena;         // Long-lived data (LineInfo, directories)
   arena_allocator_t *temp_arena; // Temporary render buffers (reset per frame)
+
+  // In-process ConPTY (Windows only)
+  ConPTYState *conpty; // NULL if not using in-process ConPTY
 #endif
 } Term;
 
@@ -194,6 +227,22 @@ emacs_value Fvterm_get_prompt_point(emacs_env *env, ptrdiff_t nargs,
                                     emacs_value args[], void *data);
 emacs_value Fvterm_reset_cursor_point(emacs_env *env, ptrdiff_t nargs,
                                       emacs_value args[], void *data);
+
+#ifdef _WIN32
+/* In-process ConPTY functions (Windows only) */
+emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
+                               emacs_value args[], void *data);
+emacs_value Fvterm_conpty_read_pending(emacs_env *env, ptrdiff_t nargs,
+                                       emacs_value args[], void *data);
+emacs_value Fvterm_conpty_write(emacs_env *env, ptrdiff_t nargs,
+                                emacs_value args[], void *data);
+emacs_value Fvterm_conpty_resize(emacs_env *env, ptrdiff_t nargs,
+                                 emacs_value args[], void *data);
+emacs_value Fvterm_conpty_is_alive(emacs_env *env, ptrdiff_t nargs,
+                                   emacs_value args[], void *data);
+emacs_value Fvterm_conpty_kill(emacs_env *env, ptrdiff_t nargs,
+                               emacs_value args[], void *data);
+#endif
 
 VTERM_EXPORT int emacs_module_init(struct emacs_runtime *ert);
 

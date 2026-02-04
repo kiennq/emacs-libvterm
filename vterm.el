@@ -6,7 +6,7 @@
 ;; Version: 0.0.2
 ;; URL: https://github.com/akermu/emacs-libvterm
 ;; Keywords: terminals
-;; Package-Requires: ((emacs "25.1"))
+;; Package-Requires: ((emacs "28.1"))
 
 
 ;; This file is not part of GNU Emacs.
@@ -527,17 +527,17 @@ copy-mode and set to nil on leaving."
   :type 'symbol
   :group 'vterm)
 
-(defcustom vterm-conpty-proxy-path nil
-  "Path to conpty_proxy.exe.
-
-If set to nil, search for the executable in the following order:
-1. In the system PATH environment variable
-2. In the vterm package installation directory
-
-Set this to the full path if you have conpty_proxy.exe in a custom location."
-  :type '(choice (const :tag "Auto-detect" nil)
-                 (file :tag "Custom path"))
+(defcustom vterm-debug nil
+  "Enable debug logging for vterm.
+When non-nil, debug messages are logged to *Messages* buffer."
+  :type 'boolean
   :group 'vterm)
+
+(defun vterm--log (format-string &rest args)
+  "Log a debug message if `vterm-debug' is non-nil.
+FORMAT-STRING and ARGS are passed to `message'."
+  (when vterm-debug
+    (apply #'message (concat "[vterm] " format-string) args)))
 
 ;;; Faces
 
@@ -693,9 +693,6 @@ for paste operations or bulk updates to avoid excessive redisplay calls.")
 (defvar-local vterm--directory-cache nil
   "Cache for directory existence checks to improve performance.
 Especially beneficial on Windows where filesystem operations are slower.")
-(defvar-local vterm--conpty-ctrl-process nil
-  "Persistent control process for sending resize commands to ConPTY on Windows.
-This avoids spawning a new process on every resize.")
 
 (define-obsolete-variable-alias 'vterm--redraw-immididately 'vterm--redraw-immediately "2025-07-15")
 
@@ -929,7 +926,11 @@ Exceptions are defined by `vterm-keymap-exceptions'."
                   #'vterm--filter-buffer-substring)
     (setq vterm--process
           (if (eq system-type 'windows-nt)
-              (vterm--conpty-proxy-make-process width (window-body-height))
+              (let ((h (window-body-height)))
+                ;; Initialize last-width/height to prevent spurious resize on first window change
+                (setq vterm--last-width width
+                      vterm--last-height h)
+                (vterm--conpty-inprocess-make width h))
             (make-process
              :name "vterm"
              :buffer (current-buffer)
@@ -956,7 +957,11 @@ Exceptions are defined by `vterm-keymap-exceptions'."
              ;; vterm--sentinel will kill the buffer
              :sentinel (when (or vterm-exit-functions
                                  vterm-kill-buffer-on-exit)
-                         #'vterm--sentinel)))))
+                         #'vterm--sentinel))))
+
+    ;; Check if process creation succeeded
+    (unless vterm--process
+      (error "Failed to create vterm process (ConPTY initialization failed)")))
 
   ;; Change major-mode is not allowed
   ;; Vterm interfaces with an underlying process. Changing the major
@@ -965,9 +970,18 @@ Exceptions are defined by `vterm-keymap-exceptions'."
             (lambda () (interactive)
               (user-error "You cannot change major mode in vterm buffers")) nil t)
 
-  (vterm--set-pty-name vterm--term (process-tty-name vterm--process))
-  (process-put vterm--process 'adjust-window-size-function
-               #'vterm--window-adjust-process-window-size)
+  ;; Set pty-name (not available for in-process ConPTY on Windows)
+  (unless vterm--conpty-notify-pipe
+    (vterm--set-pty-name vterm--term (process-tty-name vterm--process)))
+  
+  ;; Register window resize handler
+  (if vterm--conpty-notify-pipe
+      ;; For in-process ConPTY: use window-size-change-functions hook (global)
+      ;; because process-put 'adjust-window-size-function only works for PTY processes
+      (add-hook 'window-size-change-functions #'vterm--window-size-change-handler)
+    ;; For external process: use the standard Emacs mechanism
+    (process-put vterm--process 'adjust-window-size-function
+                 #'vterm--window-adjust-process-window-size))
 
   ;; Set the truncation slot for 'buffer-display-table' to the ASCII code for a
   ;; space character (32) to make the vterm buffer display a space instead of
@@ -1231,8 +1245,8 @@ running in the terminal (like Emacs or Nano)."
   (deactivate-mark)
   (when vterm--term
     (if (vterm--get-icrnl vterm--term)
-        (process-send-string vterm--process "\C-j")
-      (process-send-string vterm--process "\C-m"))))
+        (vterm--flush-output "\C-j")
+      (vterm--flush-output "\C-m"))))
 
 (defun vterm-send-tab ()
   "Send `<tab>' to the libvterm."
@@ -1621,48 +1635,75 @@ Search Manipulate Selection Data in
       (message "kill-ring is updated by vterm OSC 52(Manipulate Selection Data)"))
     ))
 
-;;; conpty-proxy
-(defun vterm--conpty-proxy-path ()
-  "Path of conpty_proxy.exe.
-If `vterm-conpty-proxy-path' is set, use that value.
-Otherwise, search in PATH for 'conpty_proxy.exe'.
-If not found in PATH, look in the vterm.el directory."
-  (or vterm-conpty-proxy-path
-      (executable-find "conpty_proxy.exe")
-      (expand-file-name "conpty_proxy.exe"
-                        (file-name-directory (locate-library "vterm.el" t)))))
+;;; In-process ConPTY (Windows)
 
-(defun vterm--conpty-proxy-make-process (width height)
-  "Make conpty proxy process."
-  (let* ((conpty-id (format "econpty_%s_%s" (format-time-string "%s") (emacs-pid)))
-         conpty-process)
-    (setq conpty-process
-          (make-process
-           :name "vterm"
-           :buffer (current-buffer)
-           :command `(,(vterm--conpty-proxy-path) "new"
-                      ,conpty-id ,(int-to-string width) ,(int-to-string height) ,(vterm--get-shell))
-           :coding 'no-conversion
-           :file-handler t
-           :filter #'vterm--filter
-           ;; The sentinel is needed if there are exit functions or if
-           ;; vterm-kill-buffer-on-exit is set to t.  In this latter case,
-           ;; vterm--sentinel will kill the buffer
-           :sentinel (when (or vterm-exit-functions
-                               vterm-kill-buffer-on-exit)
-                       #'vterm--sentinel)))
+(defvar-local vterm--conpty-notify-pipe nil
+  "Pipe process for ConPTY output notifications.
+Non-nil indicates in-process ConPTY is active.")
 
-    (process-put conpty-process 'conpty-id conpty-id)
-    conpty-process))
+(defun vterm--conpty-inprocess-filter (proc _data)
+  "Handle notification that ConPTY output is available.
+PROC is the notification pipe process, _DATA is ignored (just a signal)."
+  (when-let* ((buf (process-get proc 'vterm-buffer)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when vterm--term
+          (let ((inhibit-redisplay t)
+                (inhibit-read-only t))
+            ;; Read pending output from C module
+            (when-let* ((output (vterm--conpty-read-pending vterm--term)))
+              (when (> (length output) 0)
+                ;; Feed to libvterm for processing
+                (vterm--write-input vterm--term output)
+                (vterm--update vterm--term)))))))))
 
-(defun vterm--conpty-proxy-resize(proc width height)
-  "Send resize command to ConPTY proxy via async threadpool.
+(defun vterm--conpty-inprocess-sentinel (proc event)
+  "Sentinel for in-process ConPTY notification pipe.
+PROC is the pipe process, EVENT is the event string."
+  (when-let* ((buf (process-get proc 'vterm-buffer)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        ;; Check if shell is still alive
+        (unless (and vterm--term (vterm--conpty-is-alive vterm--term))
+          ;; Shell exited - run exit functions
+          (when vterm-exit-functions
+            (run-hook-with-args 'vterm-exit-functions buf event))
+          (when vterm-kill-buffer-on-exit
+            (kill-buffer buf)))))))
 
-IMPLEMENTATION NOTE:
-Uses vterm--conpty-resize-async (non-blocking threadpool write).
-No fallback needed - threadpool is always available on Windows."
-  (let ((conpty-id (process-get proc 'conpty-id)))
-    (vterm--conpty-resize-async conpty-id width height))
+(defun vterm--conpty-inprocess-make (width height)
+  "Initialize in-process ConPTY for Windows.
+WIDTH and HEIGHT are the terminal dimensions.
+Returns a pseudo-process (the notification pipe) for compatibility."
+  (vterm--log "conpty-inprocess-make: width=%s height=%s term=%s shell=%s"
+              width height vterm--term (vterm--get-shell))
+  ;; Create notification pipe
+  (let ((notify-pipe (make-pipe-process
+                      :name (format "vterm-notify-%s" (buffer-name))
+                      :noquery t
+                      :filter #'vterm--conpty-inprocess-filter
+                      :sentinel #'vterm--conpty-inprocess-sentinel)))
+    (vterm--log "conpty-inprocess-make: notify-pipe=%s" notify-pipe)
+    ;; Associate pipe with this buffer
+    (process-put notify-pipe 'vterm-buffer (current-buffer))
+    (setq vterm--conpty-notify-pipe notify-pipe)
+
+    ;; Initialize ConPTY in C module
+    (let ((result (vterm--conpty-init vterm--term notify-pipe (vterm--get-shell) width height)))
+      (vterm--log "conpty-inprocess-make: vterm--conpty-init returned %s" result)
+      (if result
+          ;; Return pipe as pseudo-process for compatibility
+          notify-pipe
+        ;; Initialization failed - cleanup and return nil
+        (delete-process notify-pipe)
+        (setq vterm--conpty-notify-pipe nil)
+        nil))))
+
+(defun vterm--conpty-inprocess-resize (width height)
+  "Resize in-process ConPTY directly.
+WIDTH and HEIGHT are the new dimensions."
+  (when (and vterm--term vterm--conpty-notify-pipe)
+    (vterm--conpty-resize vterm--term width height))
   (cons width height))
 
 ;;; Entry Points
@@ -1726,7 +1767,11 @@ value of `vterm-buffer-name'."
 
 (defun vterm--flush-output (output)
   "Send the virtual terminal's OUTPUT to the shell."
-  (process-send-string vterm--process output))
+  (if vterm--conpty-notify-pipe
+      ;; In-process ConPTY: write directly via C function
+      (vterm--conpty-write vterm--term output)
+    ;; External process (Unix PTY)
+    (process-send-string vterm--process output)))
 ;; Terminal emulation
 ;; This is the standard process filter for term buffers.
 ;; It emulates (most of the features of) a VT100/ANSI-style terminal.
@@ -1851,7 +1896,8 @@ Argument EVENT process event."
 (defun vterm--window-adjust-process-window-size (process windows)
   "Adjust width of window WINDOWS associated to process PROCESS.
 
-`vterm-min-window-width' determines the minimum width allowed."
+`vterm-min-window-width' determines the minimum width allowed.
+This function is used for Unix PTY processes only."
   ;; We want `vterm-copy-mode' to resemble a fundamental buffer as much as
   ;; possible.  Hence, we must not call this function when the minor mode is
   ;; enabled, otherwise the buffer would be redrawn, messing around with the
@@ -1869,14 +1915,40 @@ Argument EVENT process event."
                  (> width 0)
                  (> height 0)
                  (or (/= width vterm--last-width)
-                     ;; small chaneg in height might caused by minibuffer, we skip it
+                     ;; small change in height might caused by minibuffer, we skip it
                      (> (abs (- height vterm--last-height)) 1)))
         (vterm--set-size vterm--term height width)
-        (when (eq system-type 'windows-nt)
-          (vterm--conpty-proxy-resize vterm--process width height))
         (setq vterm--last-width width
               vterm--last-height height)
         (cons width height)))))
+
+(defun vterm--window-size-change-handler (frame)
+  "Handle window size changes for in-process ConPTY.
+FRAME is the frame that changed.  This is called from `window-size-change-functions'."
+  ;; Check each window in the frame for vterm buffers
+  (dolist (window (window-list frame 'nomini))
+    (let ((buf (window-buffer window)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when (and (derived-mode-p 'vterm-mode)
+                     vterm--conpty-notify-pipe
+                     vterm--term
+                     (not vterm-copy-mode))
+            (let* ((width (- (window-max-chars-per-line window)
+                             (vterm--get-margin-width)))
+                   (height (window-body-height window))
+                   (inhibit-read-only t))
+              (setq width (max width vterm-min-window-width))
+              (when (and (> width 0)
+                         (> height 0)
+                         (or (/= width vterm--last-width)
+                             (> (abs (- height vterm--last-height)) 1)))
+                (vterm--log "resize: %dx%d -> %dx%d"
+                            vterm--last-width vterm--last-height width height)
+                (vterm--set-size vterm--term height width)
+                (vterm--conpty-resize vterm--term width height)
+                (setq vterm--last-width width
+                      vterm--last-height height)))))))))
 
 (defun vterm--get-margin-width ()
   "Get margin width of vterm buffer when `display-line-numbers-mode' is enabled."
