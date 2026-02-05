@@ -450,7 +450,6 @@ VTERM_INLINE bool fast_compare_cells(VTermScreenCell *a, VTermScreenCell *b) {
  * ============================================================================
  */
 
-#ifdef _WIN32
 /* Arena-based string duplication (O(1) allocation, no fragmentation) */
 VTERM_INLINE char *arena_strdup(arena_allocator_t *arena, const char *str) {
   if (str == NULL)
@@ -479,20 +478,20 @@ VTERM_INLINE LineInfo *arena_alloc_lineinfo_with_dir(arena_allocator_t *arena,
   return info;
 }
 
-/* Free LineInfo (handles both malloc and arena allocations) */
+/* Free LineInfo (handles both malloc and arena allocations)
+ * Note: With arena, directory strings and LineInfo structs don't need
+ * individual free - they're bulk-freed when arena is destroyed. But we still
+ * call free() for compatibility with potential malloc-allocated items. */
 static void free_lineinfo_arena_aware(Term *term, LineInfo *line) {
+  (void)term; /* Unused but kept for API consistency */
   if (line == NULL)
     return;
-  /* On Windows with arena, directory strings are in arena and don't need
-   * individual free On other platforms or malloc-allocated, we still use
-   * malloc/free */
   if (line->directory != NULL) {
     free(line->directory); /* No-op for arena allocations */
     line->directory = NULL;
   }
   free(line); /* No-op for arena allocations */
 }
-#endif
 
 static LineInfo *alloc_lineinfo() {
   LineInfo *info = malloc(sizeof(LineInfo));
@@ -501,8 +500,7 @@ static LineInfo *alloc_lineinfo() {
   return info;
 }
 
-#ifdef _WIN32
-/* Windows version using arena (requires term context for arena access) */
+/* Arena-aware version using term context for arena access (all platforms) */
 static LineInfo *alloc_lineinfo_term(Term *term) {
   if (term->persistent_arena != NULL) {
     return arena_alloc_lineinfo(term->persistent_arena);
@@ -522,7 +520,19 @@ static LineInfo *alloc_lineinfo_with_dir_term(Term *term, const char *dir) {
   }
   return info;
 }
-#endif
+
+/* Arena-aware strdup using term context (all platforms) */
+static char *term_strdup(Term *term, const char *str) {
+  if (term->persistent_arena != NULL) {
+    return arena_strdup(term->persistent_arena, str);
+  }
+  /* Fallback to malloc */
+  if (str == NULL)
+    return NULL;
+  char *copy = malloc(strlen(str) + 1);
+  strcpy(copy, str);
+  return copy;
+}
 
 static void free_lineinfo(LineInfo *line) {
   if (line == NULL) {
@@ -589,20 +599,9 @@ static int term_sb_push(int cols, const VTermScreenCell *cells, void *data) {
   } else {
     LineInfo *lastline = term->lines[term->lines_len - 1];
     if (lastline != NULL) {
-#ifdef _WIN32
-      if (term->persistent_arena != NULL) {
-        term->lines[term->lines_len - 1] = arena_alloc_lineinfo_with_dir(
-            term->persistent_arena, lastline->directory);
-      } else
-#endif
-      {
-        LineInfo *line = alloc_lineinfo();
-        if (lastline->directory != NULL) {
-          line->directory = malloc(1 + strlen(lastline->directory));
-          strcpy(line->directory, lastline->directory);
-        }
-        term->lines[term->lines_len - 1] = line;
-      }
+      /* Use alloc_lineinfo_with_dir_term which handles arena automatically */
+      term->lines[term->lines_len - 1] =
+          alloc_lineinfo_with_dir_term(term, lastline->directory);
     }
   }
 
@@ -847,12 +846,24 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
   }
   int i, j;
 
-/* BASELINE: Original code with realloc for comparison */
+/* Buffer growth macro - uses arena allocation for performance (all platforms)
+ * Arena doesn't support realloc - we allocate new larger buffer and memcpy */
 #define PUSH_BUFFER(c)                                                         \
   do {                                                                         \
     if (length == capacity) {                                                  \
-      capacity += end_col * 4;                                                 \
-      buffer = realloc(buffer, capacity * sizeof(char));                       \
+      int new_capacity = capacity + end_col * 4;                               \
+      char *new_buffer;                                                        \
+      if (term->temp_arena != NULL) {                                          \
+        new_buffer = (char *)arena_alloc(term->temp_arena,                     \
+                                         new_capacity * sizeof(char));         \
+        if (new_buffer && length > 0) {                                        \
+          memcpy(new_buffer, buffer, length);                                  \
+        }                                                                      \
+      } else {                                                                 \
+        new_buffer = realloc(buffer, new_capacity * sizeof(char));             \
+      }                                                                        \
+      buffer = new_buffer;                                                     \
+      capacity = new_capacity;                                                 \
     }                                                                          \
     buffer[length] = (c);                                                      \
     length++;                                                                  \
@@ -874,13 +885,10 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
   int capacity = ((end_row - start_row + 1) * end_col) * 4;
   int length = 0;
   char *buffer;
-#ifdef _WIN32
-  /* Use temp arena for render buffer on Windows (reset each frame) */
+  /* Use temp arena for render buffer (reset each frame) - all platforms */
   if (term->temp_arena != NULL) {
     buffer = (char *)arena_alloc(term->temp_arena, capacity * sizeof(char));
-  } else
-#endif
-  {
+  } else {
     buffer = malloc(capacity * sizeof(char));
   }
   VTermScreenCell cell;
@@ -1024,22 +1032,10 @@ static int term_resize(int rows, int cols, void *user_data) {
       LineInfo *lastline = term->lines[term->lines_len - 1];
       for (int i = term->lines_len; i < rows; i++) {
         if (lastline != NULL) {
-#ifdef _WIN32
-          if (term->persistent_arena != NULL) {
-            term->lines[i] = arena_alloc_lineinfo_with_dir(
-                term->persistent_arena, lastline->directory);
-          } else
-#endif
-          {
-            LineInfo *line = alloc_lineinfo();
-            if (lastline->directory != NULL) {
-              line->directory = malloc(
-                  1 + strlen(term->lines[term->lines_len - 1]->directory));
-              strcpy(line->directory,
-                     term->lines[term->lines_len - 1]->directory);
-            }
-            term->lines[i] = line;
-          }
+          /* Use alloc_lineinfo_with_dir_term which handles arena automatically
+           */
+          term->lines[i] =
+              alloc_lineinfo_with_dir_term(term, lastline->directory);
         } else {
           term->lines[i] = NULL;
         }
@@ -1328,13 +1324,11 @@ static void term_redraw(Term *term, emacs_env *env) {
 
   term->is_invalidated = false;
 
-#ifdef _WIN32
   /* Reset temporary arena after each redraw for memory reuse (O(1) operation)
    */
   if (term->temp_arena != NULL) {
     arena_reset(term->temp_arena);
   }
-#endif
 
   PROFILE_END(PROFILE_TERM_REDRAW);
 }
@@ -1705,7 +1699,6 @@ void term_finalize(void *object) {
   free(term->lines);
   vterm_free(term->vt);
 
-#ifdef _WIN32
   /* Destroy arena allocators (frees all allocated memory in bulk - O(1)) */
   if (term->persistent_arena != NULL) {
     arena_destroy(term->persistent_arena);
@@ -1713,7 +1706,6 @@ void term_finalize(void *object) {
   if (term->temp_arena != NULL) {
     arena_destroy(term->temp_arena);
   }
-#endif
 
 #ifdef VTERM_PROFILE
   /* Print profiling stats when term is finalized */
@@ -1738,42 +1730,18 @@ static int handle_osc_cmd_51(Term *term, char subCmd, char *buffer) {
       free(term->directory);
       term->directory = NULL;
     }
-#ifdef _WIN32
-    if (term->persistent_arena != NULL) {
-      term->directory = arena_strdup(term->persistent_arena, buffer);
-    } else
-#endif
-    {
-      term->directory = malloc(strlen(buffer) + 1);
-      strcpy(term->directory, buffer);
-    }
+    term->directory = term_strdup(term, buffer);
     term->directory_changed = true;
 
     for (int i = term->cursor.row; i < term->lines_len; i++) {
       if (term->lines[i] == NULL) {
-#ifdef _WIN32
-        if (term->persistent_arena != NULL) {
-          term->lines[i] = arena_alloc_lineinfo(term->persistent_arena);
-        } else
-#endif
-        {
-          term->lines[i] = alloc_lineinfo();
-        }
+        term->lines[i] = alloc_lineinfo_term(term);
       }
 
       if (term->lines[i]->directory != NULL) {
         free(term->lines[i]->directory);
       }
-#ifdef _WIN32
-      if (term->persistent_arena != NULL) {
-        term->lines[i]->directory =
-            arena_strdup(term->persistent_arena, buffer);
-      } else
-#endif
-      {
-        term->lines[i]->directory = malloc(strlen(buffer) + 1);
-        strcpy(term->lines[i]->directory, buffer);
-      }
+      term->lines[i]->directory = term_strdup(term, buffer);
       if (i == term->cursor.row) {
         term->lines[i]->prompt_col = term->cursor.col;
       } else {
@@ -1784,28 +1752,19 @@ static int handle_osc_cmd_51(Term *term, char subCmd, char *buffer) {
   } else if (subCmd == 'E') {
     /* "51;E" executes elisp code */
     /* The elisp code is executed in term_redraw */
-#ifdef _WIN32
+    ElispCodeListNode *node;
     if (term->persistent_arena != NULL) {
-      ElispCodeListNode *node = (ElispCodeListNode *)arena_alloc(
-          term->persistent_arena, sizeof(ElispCodeListNode));
-      node->code_len = strlen(buffer);
-      node->code = arena_strdup(term->persistent_arena, buffer);
-      node->next = NULL;
-
-      *(term->elisp_code_p_insert) = node;
-      term->elisp_code_p_insert = &(node->next);
-    } else
-#endif
-    {
-      ElispCodeListNode *node = malloc(sizeof(ElispCodeListNode));
-      node->code_len = strlen(buffer);
-      node->code = malloc(node->code_len + 1);
-      strcpy(node->code, buffer);
-      node->next = NULL;
-
-      *(term->elisp_code_p_insert) = node;
-      term->elisp_code_p_insert = &(node->next);
+      node = (ElispCodeListNode *)arena_alloc(term->persistent_arena,
+                                              sizeof(ElispCodeListNode));
+    } else {
+      node = malloc(sizeof(ElispCodeListNode));
     }
+    node->code_len = strlen(buffer);
+    node->code = term_strdup(term, buffer);
+    node->next = NULL;
+
+    *(term->elisp_code_p_insert) = node;
+    term->elisp_code_p_insert = &(node->next);
     return 1;
   }
   return 0;
@@ -2019,12 +1978,10 @@ emacs_value Fvterm_new(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
     term->lines[i] = NULL;
   }
 
-#ifdef _WIN32
-  /* Initialize arena allocators for Windows performance optimization */
+  /* Initialize arena allocators for performance optimization (all platforms) */
   term->persistent_arena = arena_create(65536); /* 64KB for long-lived data */
   term->temp_arena =
       arena_create(131072); /* 128KB for temporary render buffers */
-#endif
 
   return env->make_user_ptr(env, term_finalize, term);
 }

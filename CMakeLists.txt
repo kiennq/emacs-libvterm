@@ -10,10 +10,11 @@ else()
 endif()
 
 # Add source files based on platform
+# arena.c is now used on all platforms for performance
 if(WIN32)
   set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c arena.c conpty.c)
 else()
-  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c)
+  set(VTERM_MODULE_SOURCES vterm-module.c utf8.c elisp.c arena.c)
 endif()
 
 add_library(vterm-module MODULE ${VTERM_MODULE_SOURCES})
