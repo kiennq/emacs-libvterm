@@ -1660,9 +1660,18 @@ PROC is the notification pipe process, _DATA is ignored (just a signal)."
             ;; Read pending output from C module
             (when-let* ((output (vterm--conpty-read-pending vterm--term)))
               (when (> (length output) 0)
+                ;; Prepend any incomplete bytes from previous call
+                (when vterm--undecoded-bytes
+                  (setq output (concat vterm--undecoded-bytes output))
+                  (setq vterm--undecoded-bytes nil))
+                ;; Extract any incomplete UTF-8 sequence at end
+                (let ((result (vterm--extract-incomplete-utf8 output)))
+                  (setq output (car result))
+                  (setq vterm--undecoded-bytes (cdr result)))
                 ;; Feed to libvterm for processing
-                (vterm--write-input vterm--term output)
-                (vterm--update vterm--term)))))))))
+                (when (> (length output) 0)
+                  (vterm--write-input vterm--term output)
+                  (vterm--update vterm--term))))))))))
 
 (defun vterm--conpty-inprocess-sentinel (proc event)
   "Sentinel for in-process ConPTY notification pipe.
@@ -1772,6 +1781,55 @@ value of `vterm-buffer-name'."
 
 ;;; Internal
 
+(defun vterm--extract-incomplete-utf8 (data)
+  "Extract incomplete UTF-8 sequence from end of DATA.
+Returns a cons cell (COMPLETE . INCOMPLETE) where COMPLETE is the
+portion of DATA with complete UTF-8 sequences and INCOMPLETE is
+any trailing bytes that form an incomplete sequence (or nil).
+
+UTF-8 encoding:
+- 0x00-0x7F: ASCII (1 byte, complete)
+- 0x80-0xBF: Continuation byte (10xxxxxx)
+- 0xC0-0xDF: 2-byte start (110xxxxx)
+- 0xE0-0xEF: 3-byte start (1110xxxx)
+- 0xF0-0xF7: 4-byte start (11110xxx)"
+  (let* ((len (length data))
+         (incomplete-start nil))
+    (when (> len 0)
+      ;; Scan backwards to find potential incomplete UTF-8 sequence
+      (let ((i (1- len))
+            (found-start nil))
+        ;; Look for incomplete sequence in last 4 bytes (max UTF-8 length)
+        (while (and (>= i (max 0 (- len 4)))
+                    (not found-start))
+          (let ((byte (aref data i)))
+            (cond
+             ;; ASCII byte (0x00-0x7F) - complete, stop scanning
+             ((< byte #x80)
+              (setq found-start t))
+             ;; Continuation byte (0x80-0xBF) - keep scanning backwards
+             ((< byte #xC0)
+              (cl-decf i))
+             ;; Start byte (0xC0-0xFF) - check if sequence is complete
+             (t
+              (let ((expected-len
+                     (cond ((< byte #xE0) 2)
+                           ((< byte #xF0) 3)
+                           ((< byte #xF8) 4)
+                           (t 1))))  ; Invalid start byte, treat as single
+                (when (> (+ i expected-len) len)
+                  ;; Sequence extends beyond data - incomplete
+                  (setq incomplete-start i))
+                (setq found-start t))))))
+        ;; Edge case: only continuation bytes found in last 4 bytes
+        (when (and (not found-start) (< i (max 0 (- len 4))))
+          (setq incomplete-start (max 0 (- len 4))))))
+    ;; Return (complete . incomplete) pair
+    (if incomplete-start
+        (cons (substring data 0 incomplete-start)
+              (substring data incomplete-start))
+      (cons data nil))))
+
 (defun vterm--flush-output (output)
   "Send the virtual terminal's OUTPUT to the shell."
   (if vterm--conpty-notify-pipe
@@ -1823,44 +1881,10 @@ which handles escape sequence parsing natively in C."
         (when vterm--undecoded-bytes
           (setq input (concat vterm--undecoded-bytes input))
           (setq vterm--undecoded-bytes nil))
-        ;; Find incomplete UTF-8 sequence at end of input
-        ;; UTF-8 continuation bytes are 10xxxxxx (0x80-0xBF)
-        ;; UTF-8 start bytes are 11xxxxxx (0xC0-0xFF)
-        (let* ((len (length input))
-               (incomplete-start nil))
-          ;; Scan backwards to find potential incomplete UTF-8 sequence
-          (when (> len 0)
-            (let ((i (1- len))
-                  (found-start nil))
-              ;; Look for incomplete sequence in last 4 bytes (max UTF-8 length)
-              (while (and (>= i (max 0 (- len 4)))
-                          (not found-start))
-                (let ((byte (aref input i)))
-                  (cond
-                   ;; ASCII byte (0x00-0x7F) - complete, stop scanning
-                   ((< byte #x80)
-                    (setq found-start t))
-                   ;; Continuation byte (0x80-0xBF) - keep scanning
-                   ((< byte #xC0)
-                    (cl-decf i))
-                   ;; Start byte (0xC0-0xFF) - check if sequence is complete
-                   (t
-                    (let ((expected-len
-                           (cond ((< byte #xE0) 2)
-                                 ((< byte #xF0) 3)
-                                 ((< byte #xF8) 4)
-                                 (t 1))))  ; Invalid, treat as single byte
-                      (when (> (+ i expected-len) len)
-                        ;; Incomplete sequence
-                        (setq incomplete-start i))
-                      (setq found-start t))))))
-              ;; Handle edge case: only continuation bytes found
-              (when (and (not found-start) (< i (max 0 (- len 4))))
-                (setq incomplete-start (max 0 (- len 4))))))
-          ;; Save incomplete bytes for next call
-          (when incomplete-start
-            (setq vterm--undecoded-bytes (substring input incomplete-start))
-            (setq input (substring input 0 incomplete-start))))
+        ;; Extract any incomplete UTF-8 sequence at end
+        (let ((result (vterm--extract-incomplete-utf8 input)))
+          (setq input (car result))
+          (setq vterm--undecoded-bytes (cdr result)))
         ;; Send all input directly to libvterm - it handles escape sequences natively
         (when (> (length input) 0)
           (ignore-errors (vterm--write-input vterm--term input)))

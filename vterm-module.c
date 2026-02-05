@@ -975,10 +975,10 @@ static void refresh_lines(Term *term, emacs_env *env, int start_row,
 #undef PUSH_BUFFER
 #undef PUSH_SEGMENT
 #undef BATCH_CAPACITY
-#ifndef _WIN32
-  /* Only free if not using arena (arena is reset in bulk) */
-  free(buffer);
-#endif
+  /* Only free if NOT using arena (arena memory is bulk-reset later) */
+  if (term->temp_arena == NULL) {
+    free(buffer);
+  }
 
   PROFILE_END(PROFILE_REFRESH_LINES);
   return;
@@ -1307,8 +1307,12 @@ static void term_redraw(Term *term, emacs_env *env) {
     emacs_value elisp_code = env->make_string(env, node->code, node->code_len);
     vterm_eval(env, elisp_code);
 
-    free(node->code);
-    free(node);
+    /* Only free if NOT using arena (arena memory is bulk-freed later) */
+    if (term->persistent_arena == NULL) {
+      free(node->code);
+      free(node);
+    }
+    /* When using arena: memory is freed in bulk by arena_destroy() */
   }
   term->elisp_code_p_insert = &term->elisp_code_first;
 
@@ -2028,11 +2032,12 @@ emacs_value Fvterm_write_input(emacs_env *env, ptrdiff_t nargs,
   Term *term = env->get_user_ptr(env, args[0]);
   ptrdiff_t len = string_bytes(env, args[1]);
 
-  if (len > 0) {
+  if (len > 1) { /* len includes null terminator, so len > 1 means non-empty */
     char bytes[len];
     env->copy_string_contents(env, args[1], bytes, &len);
-
-    vterm_input_write(term->vt, bytes, len);
+    /* len now includes null terminator - subtract 1 for actual content length
+     */
+    vterm_input_write(term->vt, bytes, len - 1);
     vterm_screen_flush_damage(term->vts);
   }
 

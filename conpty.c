@@ -124,6 +124,56 @@ int conpty_api_init(void) {
 /* IOCP completion key - not currently used, kept for future optimization */
 #define CONPTY_COMPLETION_KEY_READ 1
 
+/* Find UTF-8 safe boundary in data buffer.
+ * Returns the largest safe length <= max_len that doesn't split a UTF-8 char.
+ * UTF-8 encoding:
+ *   0x00-0x7F: ASCII (1 byte)
+ *   0x80-0xBF: Continuation byte
+ *   0xC0-0xDF: 2-byte start
+ *   0xE0-0xEF: 3-byte start
+ *   0xF0-0xF7: 4-byte start
+ */
+static size_t utf8_safe_boundary(const char *data, size_t max_len) {
+  if (max_len == 0)
+    return 0;
+
+  /* Scan backwards from end to find safe boundary */
+  size_t i = max_len;
+  while (i > 0 && i > max_len - 4) {
+    unsigned char byte = (unsigned char)data[i - 1];
+    if (byte < 0x80) {
+      /* ASCII byte - safe to cut here */
+      return i;
+    } else if (byte >= 0xC0) {
+      /* Start byte - check if sequence is complete */
+      size_t expected_len;
+      if (byte < 0xE0)
+        expected_len = 2;
+      else if (byte < 0xF0)
+        expected_len = 3;
+      else if (byte < 0xF8)
+        expected_len = 4;
+      else
+        expected_len = 1; /* Invalid, treat as single byte */
+
+      size_t seq_start = i - 1;
+      if (seq_start + expected_len <= max_len) {
+        /* Sequence is complete, safe to cut after it */
+        return max_len;
+      } else {
+        /* Sequence is incomplete, cut before it */
+        return seq_start;
+      }
+    }
+    /* Continuation byte (0x80-0xBF), keep scanning backwards */
+    i--;
+  }
+
+  /* If we scanned 4 bytes back and found only continuation bytes,
+   * something is wrong with the data, just use max_len */
+  return max_len;
+}
+
 /* Background thread that reads ConPTY output and notifies Emacs
  * Uses simple blocking reads - simpler and works with regular pipes
  */
@@ -500,8 +550,15 @@ emacs_value Fvterm_conpty_read_pending(emacs_env *env, ptrdiff_t nargs,
 
   EnterCriticalSection(&state->pending_lock);
   if (state->pending_output_len > 0) {
-    result = env->make_string(env, state->pending_output,
-                              (ptrdiff_t)state->pending_output_len);
+    /* Use make_unibyte_string to preserve raw bytes from ConPTY.
+     * Terminal data contains both escape sequences and UTF-8 text.
+     * libvterm handles UTF-8 decoding internally, so we must pass
+     * raw bytes without Emacs trying to interpret them as UTF-8.
+     * Using make_string would cause Emacs to decode UTF-8 to internal
+     * representation, then copy_string_contents would re-encode it,
+     * potentially corrupting the data. */
+    result = env->make_unibyte_string(env, state->pending_output,
+                                      (ptrdiff_t)state->pending_output_len);
     state->pending_output_len = 0;
   }
   LeaveCriticalSection(&state->pending_lock);
