@@ -68,47 +68,17 @@ int conpty_api_init(void);
  */
 void conpty_cleanup(struct Term *term);
 
-/* Emacs-exposed functions */
-
-/* Initialize in-process ConPTY
- * Args: term, notify_pipe, shell_cmd, width, height
- * Returns: t on success, nil on failure
- */
+/* Emacs-exposed functions (see vterm-module.c for docstrings) */
 emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
                                emacs_value args[], void *data);
-
-/* Read pending output from ConPTY
- * Args: term
- * Returns: string of pending output, or nil if none
- */
 emacs_value Fvterm_conpty_read_pending(emacs_env *env, ptrdiff_t nargs,
                                        emacs_value args[], void *data);
-
-/* Write input to ConPTY
- * Args: term, string
- * Returns: number of bytes written
- */
 emacs_value Fvterm_conpty_write(emacs_env *env, ptrdiff_t nargs,
                                 emacs_value args[], void *data);
-
-/* Resize ConPTY
- * Args: term, width, height
- * Returns: t on success, nil on failure
- */
 emacs_value Fvterm_conpty_resize(emacs_env *env, ptrdiff_t nargs,
                                  emacs_value args[], void *data);
-
-/* Check if ConPTY shell process is still alive
- * Args: term
- * Returns: t if alive, nil if dead
- */
 emacs_value Fvterm_conpty_is_alive(emacs_env *env, ptrdiff_t nargs,
                                    emacs_value args[], void *data);
-
-/* Kill ConPTY and cleanup resources
- * Args: term
- * Returns: t
- */
 emacs_value Fvterm_conpty_kill(emacs_env *env, ptrdiff_t nargs,
                                emacs_value args[], void *data);
 

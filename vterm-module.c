@@ -2202,6 +2202,8 @@ int emacs_module_init(struct emacs_runtime *ert) {
   Qrear_nonsticky =
       env->make_global_ref(env, env->intern(env, "rear-nonsticky"));
   Qvterm_prompt = env->make_global_ref(env, env->intern(env, "vterm-prompt"));
+  Qdefault_directory =
+      env->make_global_ref(env, env->intern(env, "default-directory"));
 
   Qface = env->make_global_ref(env, env->intern(env, "font-lock-face"));
   Qbox = env->make_global_ref(env, env->intern(env, "box"));
@@ -2296,30 +2298,66 @@ int emacs_module_init(struct emacs_runtime *ert) {
 
 #ifdef _WIN32
   /* In-process ConPTY functions (implemented in conpty.c) */
-  fun = env->make_function(env, 5, 5, Fvterm_conpty_init,
-                           "Initialize in-process ConPTY. "
-                           "Args: term notify-pipe shell width height",
-                           NULL);
+  fun = env->make_function(
+      env, 5, 5, Fvterm_conpty_init,
+      "Initialize in-process ConPTY and spawn the shell.\n\n"
+      "(vterm--conpty-init TERM NOTIFY-PIPE SHELL WIDTH HEIGHT)\n\n"
+      "TERM is the vterm terminal object.\n"
+      "NOTIFY-PIPE is a pipe process for async output notification.\n"
+      "SHELL is the shell command string (e.g., \"pwsh.exe\").\n"
+      "WIDTH and HEIGHT are the terminal dimensions in columns and rows.\n\n"
+      "The shell is started in the buffer's `default-directory'.\n"
+      "Returns t on success, nil on failure.",
+      NULL);
   bind_function(env, "vterm--conpty-init", fun);
 
-  fun = env->make_function(env, 1, 1, Fvterm_conpty_read_pending,
-                           "Read pending output from ConPTY.", NULL);
+  fun = env->make_function(
+      env, 1, 1, Fvterm_conpty_read_pending,
+      "Read pending output from ConPTY.\n\n"
+      "(vterm--conpty-read-pending TERM)\n\n"
+      "TERM is the vterm terminal object.\n"
+      "Returns a string containing any pending shell output,\n"
+      "or nil if TERM is invalid or has no ConPTY attached.",
+      NULL);
   bind_function(env, "vterm--conpty-read-pending", fun);
 
-  fun = env->make_function(env, 2, 2, Fvterm_conpty_write,
-                           "Write input directly to ConPTY.", NULL);
+  fun = env->make_function(
+      env, 2, 2, Fvterm_conpty_write,
+      "Write input to the ConPTY shell.\n\n"
+      "(vterm--conpty-write TERM STRING)\n\n"
+      "TERM is the vterm terminal object.\n"
+      "STRING is the input data to send to the shell.\n"
+      "Returns the number of bytes written, or nil on failure.",
+      NULL);
   bind_function(env, "vterm--conpty-write", fun);
 
-  fun = env->make_function(env, 3, 3, Fvterm_conpty_resize,
-                           "Resize ConPTY directly.", NULL);
+  fun = env->make_function(
+      env, 3, 3, Fvterm_conpty_resize,
+      "Resize the ConPTY terminal.\n\n"
+      "(vterm--conpty-resize TERM WIDTH HEIGHT)\n\n"
+      "TERM is the vterm terminal object.\n"
+      "WIDTH and HEIGHT are the new dimensions in columns and rows.\n"
+      "Returns t on success, nil on failure.",
+      NULL);
   bind_function(env, "vterm--conpty-resize", fun);
 
-  fun = env->make_function(env, 1, 1, Fvterm_conpty_is_alive,
-                           "Check if ConPTY shell is still running.", NULL);
+  fun = env->make_function(
+      env, 1, 1, Fvterm_conpty_is_alive,
+      "Check if the ConPTY shell process is still running.\n\n"
+      "(vterm--conpty-is-alive TERM)\n\n"
+      "TERM is the vterm terminal object.\n"
+      "Returns t if the shell is running, nil if it has exited.",
+      NULL);
   bind_function(env, "vterm--conpty-is-alive", fun);
 
-  fun = env->make_function(env, 1, 1, Fvterm_conpty_kill,
-                           "Kill ConPTY and cleanup resources.", NULL);
+  fun = env->make_function(
+      env, 1, 1, Fvterm_conpty_kill,
+      "Terminate the ConPTY shell and cleanup resources.\n\n"
+      "(vterm--conpty-kill TERM)\n\n"
+      "TERM is the vterm terminal object.\n"
+      "Stops the background reader thread, terminates the shell process,\n"
+      "and releases all ConPTY resources. Returns t.",
+      NULL);
   bind_function(env, "vterm--conpty-kill", fun);
 #endif
 

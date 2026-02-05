@@ -24,6 +24,7 @@ emacs_value Qemacs_major_version;
 emacs_value Qvterm_line_wrap;
 emacs_value Qrear_nonsticky;
 emacs_value Qvterm_prompt;
+emacs_value Qdefault_directory;
 
 // Emacs functions
 emacs_value Fblink_cursor_mode;

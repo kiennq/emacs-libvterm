@@ -415,17 +415,50 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
   free(shell_cmd);
   CONPTY_LOG("Fvterm_conpty_init: shell command converted to wide string\n");
 
+  /* Get default-directory for working directory.
+   * We need to expand it using Emacs's expand-file-name to handle:
+   * - ~ (home directory)
+   * - Relative paths
+   * - Trailing slashes that Windows doesn't like
+   */
+  emacs_value dir_val = symbol_value(env, Qdefault_directory);
+  wchar_t *wdirectory = NULL;
+  if (env->is_not_nil(env, dir_val)) {
+    /* Call (expand-file-name default-directory) to get absolute path */
+    emacs_value Qexpand = env->intern(env, "expand-file-name");
+    emacs_value expanded = env->funcall(env, Qexpand, 1, &dir_val);
+
+    if (env->is_not_nil(env, expanded)) {
+      ptrdiff_t dir_len = 0;
+      env->copy_string_contents(env, expanded, NULL, &dir_len);
+      char *directory = (char *)malloc(dir_len);
+      if (directory) {
+        env->copy_string_contents(env, expanded, directory, &dir_len);
+        CONPTY_LOG("Fvterm_conpty_init: expanded directory='%s'\n", directory);
+
+        /* Convert directory to wide string */
+        int wdir_len = MultiByteToWideChar(CP_UTF8, 0, directory, -1, NULL, 0);
+        wdirectory = (wchar_t *)malloc(wdir_len * sizeof(wchar_t));
+        if (wdirectory) {
+          MultiByteToWideChar(CP_UTF8, 0, directory, -1, wdirectory, wdir_len);
+        }
+        free(directory);
+      }
+    }
+  }
+
   PROCESS_INFORMATION pi;
   memset(&pi, 0, sizeof(pi));
 
   CONPTY_LOG("Fvterm_conpty_init: calling CreateProcessW...\n");
   BOOL created = CreateProcessW(NULL, wshell, NULL, NULL, FALSE,
-                                EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                                EXTENDED_STARTUPINFO_PRESENT, NULL, wdirectory,
                                 &si.StartupInfo, &pi);
   CONPTY_LOG("Fvterm_conpty_init: CreateProcessW returned %d, error=%lu\n",
              created, GetLastError());
 
   free(wshell);
+  free(wdirectory);
   DeleteProcThreadAttributeList(si.lpAttributeList);
   free(si.lpAttributeList);
 

@@ -27,6 +27,7 @@ extern emacs_value Qemacs_major_version;
 extern emacs_value Qvterm_line_wrap;
 extern emacs_value Qrear_nonsticky;
 extern emacs_value Qvterm_prompt;
+extern emacs_value Qdefault_directory;
 
 // Emacs functions
 extern emacs_value Fapply;
