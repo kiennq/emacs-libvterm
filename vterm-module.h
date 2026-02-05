@@ -6,6 +6,11 @@
 #include <stdbool.h>
 #include <vterm.h>
 
+#ifdef _WIN32
+#include "arena.h"
+#include "conpty.h"
+#endif
+
 // https://gcc.gnu.org/wiki/Visibility
 #if defined _WIN32 || defined __CYGWIN__
 #ifdef __GNUC__
@@ -34,7 +39,8 @@
 #define VTERM_UNLIKELY(x) (x)
 #endif
 
-VTERM_EXPORT int plugin_is_GPL_compatible;
+/* Declared here, defined in vterm-module.c */
+extern VTERM_EXPORT int plugin_is_GPL_compatible;
 
 #ifndef SB_MAX
 #define SB_MAX 100000 // Maximum 'scrollback' value.
@@ -140,6 +146,16 @@ typedef struct Term {
   char *cmd_buffer;
 
   int pty_fd;
+
+#ifdef _WIN32
+  // Arena allocators for Windows performance optimization
+  arena_allocator_t
+      *persistent_arena;         // Long-lived data (LineInfo, directories)
+  arena_allocator_t *temp_arena; // Temporary render buffers (reset per frame)
+
+  // In-process ConPTY (Windows only)
+  ConPTYState *conpty; // NULL if not using in-process ConPTY
+#endif
 } Term;
 
 static bool compare_cells(VTermScreenCell *a, VTermScreenCell *b);
