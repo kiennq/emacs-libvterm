@@ -6,8 +6,8 @@
 #include <stdbool.h>
 #include <vterm.h>
 
-#ifdef _WIN32
 #include "arena.h"
+#ifdef _WIN32
 #include "conpty.h"
 #endif
 
@@ -147,12 +147,12 @@ typedef struct Term {
 
   int pty_fd;
 
-#ifdef _WIN32
-  // Arena allocators for Windows performance optimization
+  // Arena allocators for performance optimization
   arena_allocator_t
       *persistent_arena;         // Long-lived data (LineInfo, directories)
   arena_allocator_t *temp_arena; // Temporary render buffers (reset per frame)
 
+#ifdef _WIN32
   // In-process ConPTY (Windows only)
   ConPTYState *conpty; // NULL if not using in-process ConPTY
 #endif

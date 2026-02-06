@@ -46,8 +46,16 @@ static FILE *g_conpty_debug_file = NULL;
 
 static void conpty_debug_init(void) {
   if (!g_conpty_debug_file) {
-    g_conpty_debug_file =
-        fopen("C:\\Users\\kingu\\.cache\\vterm\\conpty_debug.log", "a");
+    char debug_path[MAX_PATH];
+    const char *home = getenv("USERPROFILE");
+    if (!home)
+      home = getenv("HOME");
+    if (home)
+      snprintf(debug_path, sizeof(debug_path),
+               "%s\\.cache\\vterm\\conpty_debug.log", home);
+    else
+      snprintf(debug_path, sizeof(debug_path), "conpty_debug.log");
+    g_conpty_debug_file = fopen(debug_path, "a");
     if (g_conpty_debug_file) {
       fprintf(g_conpty_debug_file, "\n=== New session started ===\n");
       fflush(g_conpty_debug_file);
@@ -268,9 +276,9 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
   /* Extract shell command */
   ptrdiff_t shell_len = 0;
   env->copy_string_contents(env, args[2], NULL, &shell_len);
-  char *shell_cmd = (char *)malloc(shell_len);
+  char *shell_cmd = (char *)arena_alloc(term->temp_arena, shell_len);
   if (!shell_cmd) {
-    CONPTY_LOG("Fvterm_conpty_init: malloc for shell_cmd failed\n");
+    CONPTY_LOG("Fvterm_conpty_init: alloc for shell_cmd failed\n");
     return Qnil;
   }
   env->copy_string_contents(env, args[2], shell_cmd, &shell_len);
@@ -282,7 +290,6 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
 
   if (width <= 0 || height <= 0) {
     CONPTY_LOG("Fvterm_conpty_init: invalid dimensions\n");
-    free(shell_cmd);
     return Qnil;
   }
 
@@ -293,7 +300,6 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
       (ConPTYState *)arena_alloc(term->persistent_arena, sizeof(ConPTYState));
   if (!state) {
     CONPTY_LOG("Fvterm_conpty_init: arena_alloc failed\n");
-    free(shell_cmd);
     return Qnil;
   }
   memset(state, 0, sizeof(ConPTYState));
@@ -314,7 +320,6 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
     CONPTY_LOG("Fvterm_conpty_init: open_channel failed\n");
     DeleteCriticalSection(&state->pending_lock);
     term->conpty = NULL;
-    free(shell_cmd);
     return Qnil;
   }
 
@@ -338,7 +343,6 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
       CloseHandle(out_write);
     DeleteCriticalSection(&state->pending_lock);
     term->conpty = NULL;
-    free(shell_cmd);
     return Qnil;
   }
   CONPTY_LOG("Fvterm_conpty_init: pipes created OK\n");
@@ -360,7 +364,6 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
     CloseHandle(out_read);
     DeleteCriticalSection(&state->pending_lock);
     term->conpty = NULL;
-    free(shell_cmd);
     return Qnil;
   }
   CONPTY_LOG("Fvterm_conpty_init: pseudo console created OK\n");
@@ -377,11 +380,11 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
   size_t attr_size = 0;
   InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
   CONPTY_LOG("Fvterm_conpty_init: attr_size=%zu\n", attr_size);
-  si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+  si.lpAttributeList =
+      (LPPROC_THREAD_ATTRIBUTE_LIST)arena_alloc(term->temp_arena, attr_size);
   if (!si.lpAttributeList) {
     CONPTY_LOG("Fvterm_conpty_init: malloc for attr list failed\n");
     conpty_cleanup(term);
-    free(shell_cmd);
     return Qnil;
   }
 
@@ -393,26 +396,22 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
     CONPTY_LOG("Fvterm_conpty_init: InitializeProcThreadAttributeList or "
                "UpdateProcThreadAttribute failed, error=%lu\n",
                GetLastError());
-    free(si.lpAttributeList);
     conpty_cleanup(term);
-    free(shell_cmd);
     return Qnil;
   }
   CONPTY_LOG("Fvterm_conpty_init: attribute list initialized OK\n");
 
   /* Convert shell command to wide string */
   int wlen = MultiByteToWideChar(CP_UTF8, 0, shell_cmd, -1, NULL, 0);
-  wchar_t *wshell = (wchar_t *)malloc(wlen * sizeof(wchar_t));
+  wchar_t *wshell =
+      (wchar_t *)arena_alloc(term->temp_arena, wlen * sizeof(wchar_t));
   if (!wshell) {
-    CONPTY_LOG("Fvterm_conpty_init: malloc for wshell failed\n");
+    CONPTY_LOG("Fvterm_conpty_init: alloc for wshell failed\n");
     DeleteProcThreadAttributeList(si.lpAttributeList);
-    free(si.lpAttributeList);
     conpty_cleanup(term);
-    free(shell_cmd);
     return Qnil;
   }
   MultiByteToWideChar(CP_UTF8, 0, shell_cmd, -1, wshell, wlen);
-  free(shell_cmd);
   CONPTY_LOG("Fvterm_conpty_init: shell command converted to wide string\n");
 
   /* Get default-directory for working directory.
@@ -431,18 +430,18 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
     if (env->is_not_nil(env, expanded)) {
       ptrdiff_t dir_len = 0;
       env->copy_string_contents(env, expanded, NULL, &dir_len);
-      char *directory = (char *)malloc(dir_len);
+      char *directory = (char *)arena_alloc(term->temp_arena, dir_len);
       if (directory) {
         env->copy_string_contents(env, expanded, directory, &dir_len);
         CONPTY_LOG("Fvterm_conpty_init: expanded directory='%s'\n", directory);
 
         /* Convert directory to wide string */
         int wdir_len = MultiByteToWideChar(CP_UTF8, 0, directory, -1, NULL, 0);
-        wdirectory = (wchar_t *)malloc(wdir_len * sizeof(wchar_t));
+        wdirectory = (wchar_t *)arena_alloc(term->temp_arena,
+                                            wdir_len * sizeof(wchar_t));
         if (wdirectory) {
           MultiByteToWideChar(CP_UTF8, 0, directory, -1, wdirectory, wdir_len);
         }
-        free(directory);
       }
     }
   }
@@ -457,10 +456,7 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
   CONPTY_LOG("Fvterm_conpty_init: CreateProcessW returned %d, error=%lu\n",
              created, GetLastError());
 
-  free(wshell);
-  free(wdirectory);
   DeleteProcThreadAttributeList(si.lpAttributeList);
-  free(si.lpAttributeList);
 
   if (!created) {
     CONPTY_LOG("Fvterm_conpty_init: CreateProcessW FAILED\n");
@@ -537,9 +533,9 @@ emacs_value Fvterm_conpty_write(emacs_env *env, ptrdiff_t nargs,
     return env->make_integer(env, 0); /* Empty string (just null terminator) */
   }
 
-  char *bytes = (char *)malloc(len);
+  char *bytes = (char *)arena_alloc(term->temp_arena, len);
   if (!bytes) {
-    CONPTY_LOG("Fvterm_conpty_write: malloc failed\n");
+    CONPTY_LOG("Fvterm_conpty_write: alloc failed\n");
     return Qnil;
   }
   env->copy_string_contents(env, args[1], bytes, &len);
@@ -555,7 +551,6 @@ emacs_value Fvterm_conpty_write(emacs_env *env, ptrdiff_t nargs,
                       &written, NULL);
   CONPTY_LOG("Fvterm_conpty_write: WriteFile ok=%d written=%lu error=%lu\n", ok,
              written, GetLastError());
-  free(bytes);
 
   return env->make_integer(env, written);
 }
