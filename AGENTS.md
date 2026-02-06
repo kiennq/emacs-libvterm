@@ -18,7 +18,7 @@ pacman -S mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-gcc make
 
 ### Quick Build (incremental)
 ```bash
-export PATH=/q/repos/emacs-build/msys64/ucrt64/bin:$PATH
+export PATH=<path>/msys64/ucrt64/bin:$PATH
 cd /c/Users/$USER/.cache/quelpa/build/vterm
 cmake --build build --target vterm-module -j8
 ```
