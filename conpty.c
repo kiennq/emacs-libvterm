@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 /* ============================================================================
  * Debug logging
@@ -236,6 +237,183 @@ void conpty_cleanup(Term *term) {
 }
 
 /* ============================================================================
+ * Environment block builder
+ * ============================================================================
+ */
+
+/* Get key length from a L"KEY=VALUE" environment entry */
+static int wenv_key_len(const wchar_t *entry) {
+  const wchar_t *eq = wcschr(entry, L'=');
+  return eq ? (int)(eq - entry) : (int)wcslen(entry);
+}
+
+/* Check if env entry's key matches (case-insensitive, Windows convention) */
+static int wenv_key_match(const wchar_t *entry, const wchar_t *override,
+                          int override_key_len) {
+  int entry_key_len = wenv_key_len(entry);
+  return (entry_key_len == override_key_len) &&
+         (_wcsnicmp(entry, override, override_key_len) == 0);
+}
+
+#define MAX_ENV_OVERRIDES 32
+
+/* Build Unicode environment block for ConPTY child process.
+ *
+ * Inherits current OS environment, then adds/overrides:
+ * - TERM from vterm-term-environment-variable
+ * - INSIDE_EMACS=vterm
+ * - Any entries from vterm-environment
+ *
+ * Returns arena-allocated block for CREATE_UNICODE_ENVIRONMENT,
+ * or NULL (caller passes NULL to CreateProcessW to inherit env as-is).
+ */
+static wchar_t *build_conpty_env_block(emacs_env *env, Term *term) {
+  arena_allocator_t *arena = term->temp_arena;
+  if (!arena) return NULL;
+
+  wchar_t *overrides[MAX_ENV_OVERRIDES];
+  int override_key_lens[MAX_ENV_OVERRIDES];
+  int num_overrides = 0;
+
+  /* TERM=<vterm-term-environment-variable> */
+  {
+    emacs_value sym = env->intern(env, "vterm-term-environment-variable");
+    emacs_value val = symbol_value(env, sym);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+    } else if (env->is_not_nil(env, val)) {
+      ptrdiff_t slen = 0;
+      env->copy_string_contents(env, val, NULL, &slen);
+      char *cval = (char *)arena_alloc(arena, slen);
+      if (cval) {
+        env->copy_string_contents(env, val, cval, &slen);
+        size_t entry_sz = 5 + strlen(cval) + 1; /* "TERM=" + val + NUL */
+        char *entry = (char *)arena_alloc(arena, entry_sz);
+        if (entry) {
+          snprintf(entry, entry_sz, "TERM=%s", cval);
+          int wlen = MultiByteToWideChar(CP_UTF8, 0, entry, -1, NULL, 0);
+          wchar_t *w = (wchar_t *)arena_alloc(arena, wlen * sizeof(wchar_t));
+          if (w) {
+            MultiByteToWideChar(CP_UTF8, 0, entry, -1, w, wlen);
+            override_key_lens[num_overrides] = 4; /* strlen("TERM") */
+            overrides[num_overrides++] = w;
+            CONPTY_LOG("env: TERM=%s\n", cval);
+          }
+        }
+      }
+    }
+  }
+
+  /* INSIDE_EMACS=vterm (always set) */
+  {
+    static const wchar_t val[] = L"INSIDE_EMACS=vterm";
+    size_t sz = sizeof(val);
+    wchar_t *w = (wchar_t *)arena_alloc(arena, sz);
+    if (w) {
+      memcpy(w, val, sz);
+      override_key_lens[num_overrides] = 12; /* strlen("INSIDE_EMACS") */
+      overrides[num_overrides++] = w;
+      CONPTY_LOG("env: INSIDE_EMACS=vterm\n");
+    }
+  }
+
+  /* Entries from vterm-environment list */
+  {
+    emacs_value sym = env->intern(env, "vterm-environment");
+    emacs_value list = symbol_value(env, sym);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return) {
+      env->non_local_exit_clear(env);
+      list = Qnil;
+    }
+    emacs_value Qcar = env->intern(env, "car");
+    emacs_value Qcdr = env->intern(env, "cdr");
+    while (env->is_not_nil(env, list) && num_overrides < MAX_ENV_OVERRIDES) {
+      emacs_value item = env->funcall(env, Qcar, 1, &list);
+      list = env->funcall(env, Qcdr, 1, &list);
+      if (!env->is_not_nil(env, item)) continue;
+
+      ptrdiff_t slen = 0;
+      env->copy_string_contents(env, item, NULL, &slen);
+      char *centry = (char *)arena_alloc(arena, slen);
+      if (!centry) continue;
+      env->copy_string_contents(env, item, centry, &slen);
+
+      int wlen = MultiByteToWideChar(CP_UTF8, 0, centry, -1, NULL, 0);
+      wchar_t *w = (wchar_t *)arena_alloc(arena, wlen * sizeof(wchar_t));
+      if (!w) continue;
+      MultiByteToWideChar(CP_UTF8, 0, centry, -1, w, wlen);
+
+      override_key_lens[num_overrides] = wenv_key_len(w);
+      overrides[num_overrides++] = w;
+      CONPTY_LOG("env: %s\n", centry);
+    }
+  }
+
+  if (num_overrides == 0) return NULL;
+
+  /* Get current OS environment */
+  wchar_t *os_env = GetEnvironmentStringsW();
+  if (!os_env) return NULL;
+
+  /* Calculate total size needed */
+  size_t total_chars = 0;
+  const wchar_t *p = os_env;
+  while (*p) {
+    size_t elen = wcslen(p) + 1;
+    int skip = 0;
+    for (int i = 0; i < num_overrides; i++) {
+      if (wenv_key_match(p, overrides[i], override_key_lens[i])) {
+        skip = 1;
+        break;
+      }
+    }
+    if (!skip) total_chars += elen;
+    p += elen;
+  }
+  for (int i = 0; i < num_overrides; i++) {
+    total_chars += wcslen(overrides[i]) + 1;
+  }
+  total_chars += 1; /* double-null terminator */
+
+  /* Build the block */
+  wchar_t *block = (wchar_t *)arena_alloc(arena, total_chars * sizeof(wchar_t));
+  if (!block) {
+    FreeEnvironmentStringsW(os_env);
+    return NULL;
+  }
+
+  wchar_t *dst = block;
+  /* Copy OS entries, skipping overridden keys */
+  p = os_env;
+  while (*p) {
+    size_t elen = wcslen(p) + 1;
+    int skip = 0;
+    for (int i = 0; i < num_overrides; i++) {
+      if (wenv_key_match(p, overrides[i], override_key_lens[i])) {
+        skip = 1;
+        break;
+      }
+    }
+    if (!skip) {
+      memcpy(dst, p, elen * sizeof(wchar_t));
+      dst += elen;
+    }
+    p += elen;
+  }
+  /* Append override entries */
+  for (int i = 0; i < num_overrides; i++) {
+    size_t elen = wcslen(overrides[i]) + 1;
+    memcpy(dst, overrides[i], elen * sizeof(wchar_t));
+    dst += elen;
+  }
+  *dst = L'\0'; /* double-null terminator */
+
+  FreeEnvironmentStringsW(os_env);
+  CONPTY_LOG("env: block built, %zu wchars\n", total_chars);
+  return block;
+}
+
+/* ============================================================================
  * Emacs-exposed functions
  * ============================================================================
  */
@@ -349,9 +527,20 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
   CONPTY_LOG("Fvterm_conpty_init: pipes created OK\n");
 
   /* Create pseudo console */
+  /* Set UTF-8 codepage before creating pseudo console so it inherits UTF-8.
+   * The proxy (conpty_proxy.c) did this via setup_console() since it was a
+   * separate process. Here we temporarily set the codepage, create the
+   * pseudo console (which captures current codepage), then restore. */
   CONPTY_LOG("Fvterm_conpty_init: creating pseudo console...\n");
+  UINT prev_cp_out = GetConsoleOutputCP();
+  UINT prev_cp_in = GetConsoleCP();
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
   COORD size = {(SHORT)width, (SHORT)height};
   HRESULT hr = g_CreatePseudoConsole(size, in_read, out_write, 0, &state->hpc);
+  /* Restore original codepage */
+  SetConsoleOutputCP(prev_cp_out);
+  SetConsoleCP(prev_cp_in);
   CONPTY_LOG("Fvterm_conpty_init: CreatePseudoConsole hr=0x%lx\n",
              (unsigned long)hr);
 
@@ -475,9 +664,17 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
   PROCESS_INFORMATION pi;
   memset(&pi, 0, sizeof(pi));
 
-  CONPTY_LOG("Fvterm_conpty_init: calling CreateProcessW...\n");
+  /* Build environment block with vterm-specific vars (TERM, INSIDE_EMACS,
+   * vterm-environment entries). Returns NULL if nothing to override,
+   * in which case CreateProcessW inherits the OS environment as-is. */
+  wchar_t *env_block = build_conpty_env_block(env, term);
+  DWORD create_flags = EXTENDED_STARTUPINFO_PRESENT;
+  if (env_block) create_flags |= CREATE_UNICODE_ENVIRONMENT;
+
+  CONPTY_LOG("Fvterm_conpty_init: calling CreateProcessW (env_block=%s)...\n",
+             env_block ? "custom" : "inherited");
   BOOL created = CreateProcessW(NULL, wshell, NULL, NULL, FALSE,
-                                EXTENDED_STARTUPINFO_PRESENT, NULL, wdirectory,
+                                create_flags, env_block, wdirectory,
                                 &si.StartupInfo, &pi);
   CONPTY_LOG("Fvterm_conpty_init: CreateProcessW returned %d, error=%lu\n",
              created, GetLastError());
