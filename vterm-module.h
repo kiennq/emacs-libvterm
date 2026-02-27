@@ -112,6 +112,7 @@ typedef struct Term {
   bool queued_bell;
 
   Cursor cursor;
+  bool follow_terminal_cursor;
   char *title;
   bool title_changed;
 

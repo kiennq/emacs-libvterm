@@ -30,54 +30,12 @@
 #include "vterm-module.h"
 
 #include <io.h> /* for _write on Windows */
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
-/* ============================================================================
- * Debug logging
- * ============================================================================
- */
-
-#define CONPTY_DEBUG 1
-#ifdef CONPTY_DEBUG
-static FILE *g_conpty_debug_file = NULL;
-
-static void conpty_debug_init(void) {
-  if (!g_conpty_debug_file) {
-    char debug_path[MAX_PATH];
-    const char *home = getenv("USERPROFILE");
-    if (!home)
-      home = getenv("HOME");
-    if (home)
-      snprintf(debug_path, sizeof(debug_path),
-               "%s\\.cache\\vterm\\conpty_debug.log", home);
-    else
-      snprintf(debug_path, sizeof(debug_path), "conpty_debug.log");
-    g_conpty_debug_file = fopen(debug_path, "a");
-    if (g_conpty_debug_file) {
-      fprintf(g_conpty_debug_file, "\n=== New session started ===\n");
-      fflush(g_conpty_debug_file);
-    }
-  }
-}
-
-static void conpty_debug(const char *fmt, ...) {
-  conpty_debug_init();
-  if (g_conpty_debug_file) {
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(g_conpty_debug_file, fmt, args);
-    va_end(args);
-    fflush(g_conpty_debug_file);
-  }
-}
-#define CONPTY_LOG(...) conpty_debug(__VA_ARGS__)
-#else
 #define CONPTY_LOG(...) ((void)0)
-#endif
 
 /* ============================================================================
  * ConPTY API initialization
@@ -277,7 +235,8 @@ static int wenv_key_match(const wchar_t *entry, const wchar_t *override,
  */
 static wchar_t *build_conpty_env_block(emacs_env *env, Term *term) {
   arena_allocator_t *arena = term->temp_arena;
-  if (!arena) return NULL;
+  if (!arena)
+    return NULL;
 
   wchar_t *overrides[MAX_ENV_OVERRIDES];
   int override_key_lens[MAX_ENV_OVERRIDES];
@@ -338,17 +297,20 @@ static wchar_t *build_conpty_env_block(emacs_env *env, Term *term) {
     while (env->is_not_nil(env, list) && num_overrides < MAX_ENV_OVERRIDES) {
       emacs_value item = env->funcall(env, Qcar, 1, &list);
       list = env->funcall(env, Qcdr, 1, &list);
-      if (!env->is_not_nil(env, item)) continue;
+      if (!env->is_not_nil(env, item))
+        continue;
 
       ptrdiff_t slen = 0;
       env->copy_string_contents(env, item, NULL, &slen);
       char *centry = (char *)arena_alloc(arena, slen);
-      if (!centry) continue;
+      if (!centry)
+        continue;
       env->copy_string_contents(env, item, centry, &slen);
 
       int wlen = MultiByteToWideChar(CP_UTF8, 0, centry, -1, NULL, 0);
       wchar_t *w = (wchar_t *)arena_alloc(arena, wlen * sizeof(wchar_t));
-      if (!w) continue;
+      if (!w)
+        continue;
       MultiByteToWideChar(CP_UTF8, 0, centry, -1, w, wlen);
 
       override_key_lens[num_overrides] = wenv_key_len(w);
@@ -357,11 +319,13 @@ static wchar_t *build_conpty_env_block(emacs_env *env, Term *term) {
     }
   }
 
-  if (num_overrides == 0) return NULL;
+  if (num_overrides == 0)
+    return NULL;
 
   /* Get current OS environment */
   wchar_t *os_env = GetEnvironmentStringsW();
-  if (!os_env) return NULL;
+  if (!os_env)
+    return NULL;
 
   /* Calculate total size needed */
   size_t total_chars = 0;
@@ -375,7 +339,8 @@ static wchar_t *build_conpty_env_block(emacs_env *env, Term *term) {
         break;
       }
     }
-    if (!skip) total_chars += elen;
+    if (!skip)
+      total_chars += elen;
     p += elen;
   }
   for (int i = 0; i < num_overrides; i++) {
@@ -643,13 +608,13 @@ emacs_value Fvterm_conpty_init(emacs_env *env, ptrdiff_t nargs,
    * in which case CreateProcessW inherits the OS environment as-is. */
   wchar_t *env_block = build_conpty_env_block(env, term);
   DWORD create_flags = EXTENDED_STARTUPINFO_PRESENT;
-  if (env_block) create_flags |= CREATE_UNICODE_ENVIRONMENT;
+  if (env_block)
+    create_flags |= CREATE_UNICODE_ENVIRONMENT;
 
   CONPTY_LOG("Fvterm_conpty_init: calling CreateProcessW (env_block=%s)...\n",
              env_block ? "custom" : "inherited");
-  BOOL created = CreateProcessW(NULL, wshell, NULL, NULL, FALSE,
-                                create_flags, env_block, wdirectory,
-                                &si.StartupInfo, &pi);
+  BOOL created = CreateProcessW(NULL, wshell, NULL, NULL, FALSE, create_flags,
+                                env_block, wdirectory, &si.StartupInfo, &pi);
   CONPTY_LOG("Fvterm_conpty_init: CreateProcessW returned %d, error=%lu\n",
              created, GetLastError());
 

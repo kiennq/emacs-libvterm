@@ -1041,84 +1041,31 @@ static void refresh_scrollback(Term *term, emacs_env *env) {
   PROFILE_END(PROFILE_REFRESH_SCROLLBACK);
 }
 
-/* Cache for adjust_topline optimization - cursor position + viewport info */
-static struct {
-  int cursor_row;
-  int cursor_col;
-  int term_height;
-  int last_win_body_height;
-  bool valid;
-} adjust_topline_cache = {-1, -1, -1, -1, false};
-
 static void adjust_topline(Term *term, emacs_env *env) {
   PROFILE_START(PROFILE_ADJUST_TOPLINE);
+
+  if (!term->follow_terminal_cursor) {
+    PROFILE_END(PROFILE_ADJUST_TOPLINE);
+    return;
+  }
 
   VTermState *state = vterm_obtain_state(term->vt);
   VTermPos pos;
   vterm_state_get_cursorpos(state, &pos);
 
-  /* OPTIMIZATION 1: Skip if cursor position and terminal height unchanged */
-  if (adjust_topline_cache.valid &&
-      pos.row == adjust_topline_cache.cursor_row &&
-      pos.col == adjust_topline_cache.cursor_col &&
-      term->height == adjust_topline_cache.term_height) {
-    PROFILE_END(PROFILE_ADJUST_TOPLINE);
-    return;
-  }
-
   /* pos.row-term->height is negative, so we backward term->height-pos.row
-   * lines from end of buffer
+   * lines from end of buffer.
    */
-
   goto_line(env, pos.row - term->height);
   goto_col(term, env, pos.row, pos.col);
 
-  /* OPTIMIZATION 2: Get selected window and check if we need expensive
-   * operations */
   emacs_value swindow = selected_window(env);
   int win_body_height =
       env->extract_integer(env, window_body_height(env, swindow));
 
-  /* Cache viewport info for next comparison */
-  int old_cursor_row = adjust_topline_cache.cursor_row;
-  adjust_topline_cache.cursor_row = pos.row;
-  adjust_topline_cache.cursor_col = pos.col;
-  adjust_topline_cache.term_height = term->height;
-  adjust_topline_cache.last_win_body_height = win_body_height;
-  adjust_topline_cache.valid = true;
-
-  /* OPTIMIZATION 3: Smart viewport check - skip recenter if cursor safely
-   * within view Calculate cursor position within the visible viewport:
-   * - Bottom of terminal is at line (term->height)
-   * - Cursor is at pos.row from bottom
-   * - Visible viewport shows win_body_height lines
-   */
-  int cursor_from_bottom = term->height - pos.row;
-  int margin = 3; /* Safety margin from viewport edges */
-
-  /* Check if cursor is safely within viewport (not near edges) */
-  bool cursor_in_safe_zone = (cursor_from_bottom > margin) &&
-                             (cursor_from_bottom < win_body_height - margin);
-
-  /* If cursor moved by only a small amount and is in safe zone, skip
-   * recentering */
-  if (cursor_in_safe_zone && old_cursor_row >= 0) {
-    int cursor_delta = abs(pos.row - old_cursor_row);
-    if (cursor_delta <= 2) {
-      /* Minor cursor movement within safe zone - no recenter needed */
-      PROFILE_END(PROFILE_ADJUST_TOPLINE);
-      return;
-    }
-  }
-
-  /* OPTIMIZATION 4: Only recenter selected window, skip multi-window sync
-   * Original code iterated all windows and synced points. This is expensive.
-   * Most users only care about selected window. If needed, other windows
-   * will sync when they become selected.
-   */
-
   /* recenter: If ARG is negative, it counts up from the bottom of the
-   * window. (ARG should be less than the height of the window) */
+   * window. (ARG should be less than the height of the window)
+   */
   if (term->height - pos.row <= win_body_height) {
     recenter(env, env->make_integer(env, pos.row - term->height));
   } else {
@@ -1126,11 +1073,6 @@ static void adjust_topline(Term *term, emacs_env *env) {
   }
 
   PROFILE_END(PROFILE_ADJUST_TOPLINE);
-}
-
-/* Invalidate adjust_topline cache (call when window configuration changes) */
-static void invalidate_adjust_topline_cache(void) {
-  adjust_topline_cache.valid = false;
 }
 
 static void invalidate_terminal(Term *term, int start_row, int end_row) {
@@ -1615,23 +1557,6 @@ void term_finalize(void *object) {
   arena_destroy(term->temp_arena);
 
 #ifdef VTERM_PROFILE
-  /* Print profiling stats when term is finalized */
-  {
-    char debug_path[MAX_PATH];
-    const char *home = getenv("USERPROFILE");
-    if (!home)
-      home = getenv("HOME");
-    if (home)
-      snprintf(debug_path, sizeof(debug_path),
-               "%s\\.cache\\vterm\\finalize-debug.txt", home);
-    else
-      snprintf(debug_path, sizeof(debug_path), "finalize-debug.txt");
-    FILE *debug = fopen(debug_path, "a");
-    if (debug) {
-      fprintf(debug, "term_finalize called\n");
-      fclose(debug);
-    }
-  }
   profile_print_stats();
 #endif
 
@@ -1875,6 +1800,7 @@ emacs_value Fvterm_new(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   term->cursor.cursor_type_changed = false;
   term->cursor.cursor_blink = false;
   term->cursor.cursor_blink_changed = false;
+  term->follow_terminal_cursor = true;
   term->directory = NULL;
   term->directory_changed = false;
   term->elisp_code_first = NULL;
@@ -1928,6 +1854,11 @@ emacs_value Fvterm_update(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 emacs_value Fvterm_redraw(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
                           void *data) {
   Term *term = env->get_user_ptr(env, args[0]);
+
+  if (nargs > 1) {
+    term->follow_terminal_cursor = env->is_not_nil(env, args[1]);
+  }
+
   term_redraw(term, env);
   return env->make_integer(env, 0);
 }
@@ -1953,6 +1884,10 @@ emacs_value Fvterm_set_size(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   Term *term = env->get_user_ptr(env, args[0]);
   int rows = env->extract_integer(env, args[1]);
   int cols = env->extract_integer(env, args[2]);
+
+  if (nargs > 3) {
+    term->follow_terminal_cursor = env->is_not_nil(env, args[3]);
+  }
 
   if (cols != term->width || rows != term->height) {
     term->height_resize = rows - term->height;
@@ -2137,14 +2072,14 @@ int emacs_module_init(struct emacs_runtime *ert) {
   bind_function(env, "vterm--update", fun);
 
   fun =
-      env->make_function(env, 1, 1, Fvterm_redraw, "Redraw the screen.", NULL);
+      env->make_function(env, 1, 2, Fvterm_redraw, "Redraw the screen.", NULL);
   bind_function(env, "vterm--redraw", fun);
 
   fun = env->make_function(env, 2, 2, Fvterm_write_input,
                            "Write input to vterm.", NULL);
   bind_function(env, "vterm--write-input", fun);
 
-  fun = env->make_function(env, 3, 3, Fvterm_set_size,
+  fun = env->make_function(env, 3, 4, Fvterm_set_size,
                            "Set the size of the terminal.", NULL);
   bind_function(env, "vterm--set-size", fun);
 

@@ -540,6 +540,12 @@ When non-nil, debug messages are logged to *Messages* buffer."
   :type 'boolean
   :group 'vterm)
 
+(defvar-local vterm-follow-terminal-cursor t
+  "When non-nil, keep Emacs point following terminal cursor on redraw.
+
+When nil, redraw updates terminal content but keeps current Emacs point and
+window position unchanged.")
+
 (defun vterm--log (format-string &rest args)
   "Log a debug message if `vterm-debug' is non-nil.
 FORMAT-STRING and ARGS are passed to `message'."
@@ -1617,7 +1623,11 @@ Argument BUFFER the terminal buffer."
             (window--adjust-process-windows))
           (setq vterm--last-char-height char-height
                 vterm--last-char-width char-width)
-          (vterm--redraw vterm--term)
+          (if vterm-follow-terminal-cursor
+              (vterm--redraw vterm--term t)
+            ;; Keep point stable while still updating terminal content.
+            (save-excursion
+              (vterm--redraw vterm--term nil)))
           (unless (zerop (window-hscroll))
             (when (cl-member (selected-window) windows :test #'eq)
               (set-window-hscroll (selected-window) 0))))))))
@@ -1933,7 +1943,10 @@ This function is used for Unix PTY processes only."
                  (or (/= width vterm--last-width)
                      ;; small change in height might caused by minibuffer, we skip it
                      (> (abs (- height vterm--last-height)) 1)))
-        (vterm--set-size vterm--term height width)
+        (if vterm-follow-terminal-cursor
+            (vterm--set-size vterm--term height width t)
+          (save-excursion
+            (vterm--set-size vterm--term height width nil)))
         (setq vterm--last-width width
               vterm--last-height height)
         (cons width height)))))
@@ -1961,7 +1974,10 @@ FRAME is the frame that changed.  This is called from `window-size-change-functi
                              (> (abs (- height vterm--last-height)) 1)))
                 (vterm--log "resize: %dx%d -> %dx%d"
                             vterm--last-width vterm--last-height width height)
-                (vterm--set-size vterm--term height width)
+                (if vterm-follow-terminal-cursor
+                    (vterm--set-size vterm--term height width t)
+                  (save-excursion
+                    (vterm--set-size vterm--term height width nil)))
                 (vterm--conpty-resize vterm--term width height)
                 (setq vterm--last-width width
                       vterm--last-height height)))))))))
