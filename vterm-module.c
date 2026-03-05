@@ -1304,6 +1304,9 @@ static int term_settermprop(VTermProp prop, VTermValue *val, void *user_data) {
   case VTERM_PROP_ALTSCREEN:
     invalidate_terminal(term, 0, term->height);
     break;
+  case VTERM_PROP_MOUSE:
+    term->mouse_mode = val->number;
+    break;
   default:
     return 0;
   }
@@ -1879,6 +1882,40 @@ emacs_value Fvterm_write_input(emacs_env *env, ptrdiff_t nargs,
   return env->make_integer(env, 0);
 }
 
+emacs_value Fvterm_mouse_move(emacs_env *env, ptrdiff_t nargs,
+                              emacs_value args[], void *data) {
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term)
+    return Qnil;
+  int row = (int)env->extract_integer(env, args[1]);
+  int col = (int)env->extract_integer(env, args[2]);
+  VTermModifier mod = (VTermModifier)env->extract_integer(env, args[3]);
+  vterm_mouse_move(term->vt, row, col, mod);
+  term_flush_output(term, env);
+  return Qnil;
+}
+
+emacs_value Fvterm_mouse_button(emacs_env *env, ptrdiff_t nargs,
+                                emacs_value args[], void *data) {
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term)
+    return Qnil;
+  int button = (int)env->extract_integer(env, args[1]);
+  bool pressed = env->is_not_nil(env, args[2]);
+  VTermModifier mod = (VTermModifier)env->extract_integer(env, args[3]);
+  vterm_mouse_button(term->vt, button, pressed, mod);
+  term_flush_output(term, env);
+  return Qnil;
+}
+
+emacs_value Fvterm_mouse_mode(emacs_env *env, ptrdiff_t nargs,
+                              emacs_value args[], void *data) {
+  Term *term = env->get_user_ptr(env, args[0]);
+  if (!term)
+    return env->make_integer(env, 0);
+  return env->make_integer(env, term->mouse_mode);
+}
+
 emacs_value Fvterm_set_size(emacs_env *env, ptrdiff_t nargs, emacs_value args[],
                             void *data) {
   Term *term = env->get_user_ptr(env, args[0]);
@@ -2078,6 +2115,19 @@ int emacs_module_init(struct emacs_runtime *ert) {
   fun = env->make_function(env, 2, 2, Fvterm_write_input,
                            "Write input to vterm.", NULL);
   bind_function(env, "vterm--write-input", fun);
+
+  fun = env->make_function(env, 4, 4, Fvterm_mouse_move,
+                           "Move mouse to ROW, COL with modifier MOD.", NULL);
+  bind_function(env, "vterm--mouse-move", fun);
+
+  fun = env->make_function(env, 4, 4, Fvterm_mouse_button,
+                           "Send mouse BUTTON (1-5) event, PRESSED bool, MOD.",
+                           NULL);
+  bind_function(env, "vterm--mouse-button", fun);
+
+  fun = env->make_function(env, 1, 1, Fvterm_mouse_mode,
+                           "Return current mouse tracking mode integer.", NULL);
+  bind_function(env, "vterm--mouse-mode", fun);
 
   fun = env->make_function(env, 3, 4, Fvterm_set_size,
                            "Set the size of the terminal.", NULL);

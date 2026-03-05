@@ -703,6 +703,10 @@ for paste operations or bulk updates to avoid excessive redisplay calls.")
 (defvar-local vterm--delete-region-function (symbol-function #'delete-region))
 (defvar-local vterm--undecoded-bytes nil)
 (defvar-local vterm--copy-mode-fake-newlines nil)
+(defvar-local vterm--mouse-mode 0
+  "Current mouse tracking mode reported by the terminal application.
+0 = none, 1 = click, 2 = drag, 3 = all-motion.
+Mirrors VTERM_PROP_MOUSE_* values from libvterm.")
 (defvar-local vterm--directory-cache nil
   "Cache for directory existence checks to improve performance.
 Especially beneficial on Windows where filesystem operations are slower.")
@@ -1410,6 +1414,72 @@ move the cursor to the prompt area."
       (mouse-set-point event promote-to-region)
     (vterm-reset-cursor-point)))
 
+(defun vterm--mouse-active-p ()
+  "Return non-nil when the terminal application is requesting mouse tracking."
+  (> vterm--mouse-mode 0))
+
+(defun vterm--mouse-sync-mode ()
+  "Synchronize `vterm--mouse-mode' from the C layer and update keybindings."
+  (when vterm--term
+    (let ((mode (vterm--mouse-mode vterm--term)))
+      (unless (= mode vterm--mouse-mode)
+        (setq vterm--mouse-mode mode)
+        (if (> mode 0)
+            (progn
+              (local-set-key [mouse-1]       #'vterm--mouse-handler)
+              (local-set-key [down-mouse-1]  #'vterm--mouse-handler)
+              (local-set-key [mouse-2]       #'vterm--mouse-handler)
+              (local-set-key [down-mouse-2]  #'vterm--mouse-handler)
+              (local-set-key [mouse-3]       #'vterm--mouse-handler)
+              (local-set-key [down-mouse-3]  #'vterm--mouse-handler))
+          (local-set-key [mouse-1]       #'vterm-mouse-set-point)
+          (local-set-key [down-mouse-1]  nil)
+          (local-set-key [mouse-2]       nil)
+          (local-set-key [down-mouse-2]  nil)
+          (local-set-key [mouse-3]       nil)
+          (local-set-key [down-mouse-3]  nil))))))
+
+(defun vterm--mouse-event-info (event)
+  "Extract (button pressed row col mod-flags) from a mouse EVENT.
+Returns nil if the event type is not a recognised mouse button."
+  (let* ((type    (event-basic-type event))
+         (mods    (event-modifiers event))
+         (pressed (memq 'down mods))
+         (mod-flags (logior
+                     (if (memq 'shift   mods) 1 0)
+                     (if (memq 'meta    mods) 2 0)
+                     (if (memq 'control mods) 4 0)))
+         (button (pcase type
+                   ('mouse-1   1)
+                   ('mouse-2   2)
+                   ('mouse-3   3)
+                   ('wheel-up  4)
+                   ('mouse-4   4)
+                   ('wheel-down 5)
+                   ('mouse-5   5)
+                   (_          nil))))
+    (when button
+      (let* ((pos  (event-start event))
+             ;; posn-col-row returns (col . row) relative to the top-left
+             ;; of the window body when called without optional arg.
+             (xy   (posn-col-row pos))
+             (col  (car xy))
+             (row  (cdr xy)))
+        (list button pressed row col mod-flags)))))
+
+(defun vterm--mouse-handler (event)
+  "Forward mouse EVENT to the terminal application via libvterm."
+  (interactive "e")
+  (when (and vterm--term (vterm--mouse-active-p))
+    (let ((info (vterm--mouse-event-info event)))
+      (when info
+        (cl-destructuring-bind (button pressed row col mod-flags) info
+          ;; Button press (down-mouse-*): send move + press.
+          ;; Button release (mouse-*): send move + release.
+          (vterm--mouse-move vterm--term row col mod-flags)
+          (vterm--mouse-button vterm--term button (if pressed t nil) mod-flags)
+          (setq vterm--redraw-immediately t))))))
+
 (defun vterm-send-string (string &optional paste-p)
   "Send the string STRING to vterm.
 Optional argument PASTE-P paste-p."
@@ -1628,6 +1698,8 @@ Argument BUFFER the terminal buffer."
             ;; Keep point stable while still updating terminal content.
             (save-excursion
               (vterm--redraw vterm--term nil)))
+          ;; Sync mouse-tracking mode from the C layer after each redraw.
+          (vterm--mouse-sync-mode)
           (unless (zerop (window-hscroll))
             (when (cl-member (selected-window) windows :test #'eq)
               (set-window-hscroll (selected-window) 0))))))))

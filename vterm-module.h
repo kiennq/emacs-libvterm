@@ -148,6 +148,8 @@ typedef struct Term {
 
   int pty_fd;
 
+  int mouse_mode; /* Current mouse tracking mode (VTERM_PROP_MOUSE_* value) */
+
   // Arena allocators for performance optimization
   arena_allocator_t
       *persistent_arena;         // Long-lived data (LineInfo, directories)
@@ -200,6 +202,13 @@ emacs_value Fvterm_get_prompt_point(emacs_env *env, ptrdiff_t nargs,
                                     emacs_value args[], void *data);
 emacs_value Fvterm_reset_cursor_point(emacs_env *env, ptrdiff_t nargs,
                                       emacs_value args[], void *data);
+
+emacs_value Fvterm_mouse_move(emacs_env *env, ptrdiff_t nargs,
+                              emacs_value args[], void *data);
+emacs_value Fvterm_mouse_button(emacs_env *env, ptrdiff_t nargs,
+                                emacs_value args[], void *data);
+emacs_value Fvterm_mouse_mode(emacs_env *env, ptrdiff_t nargs,
+                              emacs_value args[], void *data);
 
 VTERM_EXPORT int emacs_module_init(struct emacs_runtime *ert);
 
